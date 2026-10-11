@@ -72,7 +72,6 @@ jobs:
 
       - name: 转存镜像 (skopeo copy)
         id: copy
-        continue-on-error: true
         env:
           SRC: docker://${{ steps.ref.outputs.src }}
           DEST: docker://${{ steps.ref.outputs.dest }}
@@ -113,7 +112,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: 回调 Workers（成功 -> ready）
-        if: steps.copy.outcome == 'success'
+        if: success()
         env:
           URL: ${{ secrets.CALLBACK_URL }}
           TOKEN: ${{ secrets.CALLBACK_TOKEN }}
@@ -132,7 +131,7 @@ jobs:
                   '{acr_repo:$repo, image_ref:$ref, status:"ready", blobs:$blobs}')"
 
       - name: 回调 Workers（失败 -> pending 重置）
-        if: steps.copy.outcome == 'failure'
+        if: failure()
         env:
           URL: ${{ secrets.CALLBACK_URL }}
           TOKEN: ${{ secrets.CALLBACK_TOKEN }}
