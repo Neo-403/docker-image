@@ -11,9 +11,6 @@ name: Mirror Docker Image
 on:
   workflow_dispatch:
     inputs:
-      source_alias:
-        description: '源缩写，如 dockerhub / ghcr / quay'
-        required: true
       source_registry:
         description: '上游 registry，如 docker.io / ghcr.io / quay.io'
         required: true
@@ -28,6 +25,9 @@ on:
         required: true
       acr_repo_name:
         description: '单一物理 ACR 仓库名（所有镜像统一推送目标）'
+        required: true
+      acr_tag:
+        description: '目标槽位 tag（如 image037），由 Worker 分配'
         required: true
 
 jobs:
@@ -46,23 +46,16 @@ jobs:
           REF: ${{ github.event.inputs.image_ref }}
           SRC_REG: ${{ github.event.inputs.source_registry }}
           NAME: ${{ github.event.inputs.image_name }}
-          ALIAS: ${{ github.event.inputs.source_alias }}
           ACR_REPO_NAME: ${{ github.event.inputs.acr_repo_name }}
+          ACR_TAG: ${{ github.event.inputs.acr_tag }}
           REG: ${{ secrets.ACR_REGISTRY }}
           NS: ${{ secrets.ACR_NAMESPACE }}
         run: |
           if [[ "$REF" == sha256:* ]]; then SEP="@"; else SEP=":"; fi
-          # 编码为单一 ACR 仓库下的 tag：dockerhub 无前缀，其它源加 <alias>_ 前缀；/ -> -，: -> -
-          ENC_NAME="${NAME//\//-}"
-          ENC_REF="${REF//:/-}"
-          if [ "$ALIAS" = "dockerhub" ]; then
-            TAG="${ENC_NAME}_${ENC_REF}"
-          else
-            TAG="${ALIAS}_${ENC_NAME}_${ENC_REF}"
-          fi
-          echo "src=${SRC_REG}/${NAME}${SEP}${REF}"          >> "$GITHUB_OUTPUT"
-          echo "dest=${REG}/${NS}/${ACR_REPO_NAME}:${TAG}"  >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}"                                  >> "$GITHUB_OUTPUT"
+          # 目标 tag 由 Worker 分配的固定槽位（image001..imageN），直接复用
+          echo "src=${SRC_REG}/${NAME}${SEP}${REF}"            >> "$GITHUB_OUTPUT"
+          echo "dest=${REG}/${NS}/${ACR_REPO_NAME}:${ACR_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${ACR_TAG}"                                >> "$GITHUB_OUTPUT"
 
       - name: 登录阿里云 ACR
         run: |
