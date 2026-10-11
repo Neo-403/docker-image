@@ -41,10 +41,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: 安装依赖 (skopeo / jq)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y skopeo jq
+      # 用缓存安装 skopeo / jq：命中缓存时直接复用，跳过 apt-get update + 下载，显著缩短启动耗时
+      - name: 安装依赖 (skopeo / jq，带缓存)
+        uses: awalsh128/cache-apt-pkgs-action@v1.5.1
+        with:
+          packages: skopeo jq
+          version: 1.0
 
       - name: 构造源/目标引用
         id: ref
