@@ -2,13 +2,18 @@ name: Mirror Docker Image
 
 # 由 Cloudflare Workers 通过 workflow_dispatch 触发
 #  inputs:
+#   source_alias    : 源缩写（dockerhub / ghcr / quay ...），用于 ACR tag 前缀
 #   source_registry : 上游 registry（如 docker.io / ghcr.io / quay.io）
 #   image_name      : 上游镜像名（如 library/nginx / bitnami/nginx / nginx）
 #   image_ref       : Tag（如 latest）或 digest（sha256:...）
-#   acr_repo        : 目标 ACR 仓库路径（含源别名前缀，如 dockerhub/library/nginx / ghcr/nginx）
+#   acr_repo        : 逻辑仓库标识（含源别名前缀，仅用于回调 KV key，如 dockerhub/library/nginx）
+#   acr_repo_name   : 单一物理 ACR 仓库名（所有镜像统一推送到此，由 Worker 的 ACR_REPO 注入）
 on:
   workflow_dispatch:
     inputs:
+      source_alias:
+        description: '源缩写，如 dockerhub / ghcr / quay'
+        required: true
       source_registry:
         description: '上游 registry，如 docker.io / ghcr.io / quay.io'
         required: true
@@ -19,7 +24,10 @@ on:
         description: 'Tag（如 latest）或 digest（sha256:...）'
         required: true
       acr_repo:
-        description: '目标 ACR 仓库路径（含源别名前缀）'
+        description: '逻辑仓库标识（含源别名前缀，用于回调 KV key）'
+        required: true
+      acr_repo_name:
+        description: '单一物理 ACR 仓库名（所有镜像统一推送目标）'
         required: true
 
 jobs:
@@ -38,14 +46,23 @@ jobs:
           REF: ${{ github.event.inputs.image_ref }}
           SRC_REG: ${{ github.event.inputs.source_registry }}
           NAME: ${{ github.event.inputs.image_name }}
-          ACR_REPO: ${{ github.event.inputs.acr_repo }}
+          ALIAS: ${{ github.event.inputs.source_alias }}
+          ACR_REPO_NAME: ${{ github.event.inputs.acr_repo_name }}
           REG: ${{ secrets.ACR_REGISTRY }}
           NS: ${{ secrets.ACR_NAMESPACE }}
         run: |
           if [[ "$REF" == sha256:* ]]; then SEP="@"; else SEP=":"; fi
-          echo "src=${SRC_REG}/${NAME}${SEP}${REF}"        >> "$GITHUB_OUTPUT"
-          echo "dest=${REG}/${NS}/${ACR_REPO}${SEP}${REF}" >> "$GITHUB_OUTPUT"
-          echo "sep=${SEP}"                                >> "$GITHUB_OUTPUT"
+          # 编码为单一 ACR 仓库下的 tag：dockerhub 无前缀，其它源加 <alias>_ 前缀；/ -> -，: -> -
+          ENC_NAME="${NAME//\//-}"
+          ENC_REF="${REF//:/-}"
+          if [ "$ALIAS" = "dockerhub" ]; then
+            TAG="${ENC_NAME}_${ENC_REF}"
+          else
+            TAG="${ALIAS}_${ENC_NAME}_${ENC_REF}"
+          fi
+          echo "src=${SRC_REG}/${NAME}${SEP}${REF}"          >> "$GITHUB_OUTPUT"
+          echo "dest=${REG}/${NS}/${ACR_REPO_NAME}:${TAG}"  >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"                                  >> "$GITHUB_OUTPUT"
 
       - name: 登录阿里云 ACR
         run: |
