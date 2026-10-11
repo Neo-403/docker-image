@@ -63,14 +63,32 @@ jobs:
           echo "Copy: $SRC -> $DEST"
           skopeo copy "$SRC" "$DEST"
 
-      - name: 收集 blob digest 列表
+      - name: 收集完整 digest 列表（index -> 平台 manifest -> layer/config）
         if: steps.copy.outcome == 'success'
         id: blobs
         env:
-          SRC: docker://${{ steps.ref.outputs.src }}
+          SRC: ${{ steps.ref.outputs.src }}
+          SRC_REG: ${{ github.event.inputs.source_registry }}
+          NAME: ${{ github.event.inputs.image_name }}
         run: |
-          DIGESTS=$(skopeo inspect --raw "$SRC" \
-            | jq -r '.. | objects | .digest? // empty' | sort -u)
+          TOP=$(skopeo inspect --raw "docker://$SRC" 2>/dev/null)
+          # 顶层：index 取各平台 manifest digest；单架构取 layer/config digest
+          DIGESTS=$(echo "$TOP" | jq -r '
+            if (.manifests | type) == "array" then
+              .manifests[].digest
+            else
+              (.layers[]? | .digest // empty), (.config.digest // empty)
+            end' 2>/dev/null)
+
+          # 多架构：下钻每个平台 manifest，收集其 layer/config digest
+          if echo "$TOP" | jq -e '(.manifests | type) == "array"' >/dev/null 2>&1; then
+            for d in $(echo "$TOP" | jq -r '.manifests[].digest'); do
+              PLAT=$(skopeo inspect --raw "docker://${SRC_REG}/${NAME}@${d}" 2>/dev/null)
+              DIGESTS="$DIGESTS"$'\n'"$(echo "$PLAT" | jq -r '(.layers[]? | .digest // empty), (.config.digest // empty)' 2>/dev/null)"
+            done
+          fi
+
+          DIGESTS=$(echo "$DIGESTS" | sort -u | sed '/^$/d')
           {
             echo "digests<<EOF"
             echo "$DIGESTS"
