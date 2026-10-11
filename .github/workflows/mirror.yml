@@ -1,6 +1,6 @@
 name: Mirror Docker Image
 # 运行列表直接显示正在转存的镜像与槽位，便于排查问题
-run-name: "Mirror ${{ github.event.inputs.acr_repo }} -> ${{ github.event.inputs.acr_tag }}"
+run-name: "${{ github.event.inputs.display_name }} -> ${{ github.event.inputs.acr_tag }}"
 
 # 由 Cloudflare Workers 通过 workflow_dispatch 触发
 #  inputs:
@@ -31,6 +31,10 @@ on:
       acr_tag:
         description: '目标槽位 tag（如 image037），由 Worker 分配'
         required: true
+      display_name:
+        description: '运行列表展示名（含 tag；Docker Hub 不带 dockerhub/、library/ 前缀）'
+        required: false
+        default: ''
 
 jobs:
   mirror:
