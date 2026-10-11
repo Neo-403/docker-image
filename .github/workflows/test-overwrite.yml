@@ -1,0 +1,40 @@
+name: Test ACR Overwrite
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装 skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: 登录阿里云 ACR
+        run: |
+          skopeo login "${{ secrets.ACR_REGISTRY }}" \
+            --username "${{ secrets.ACR_USERNAME }}" \
+            --password "${{ secrets.ACR_PASSWORD }}"
+
+      - name: 第一次推送（不同镜像 hello-world -> zwzw:test-overwrite）
+        id: first
+        continue-on-error: true
+        run: |
+          skopeo copy docker://docker.io/library/hello-world:latest \
+            docker://${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/zwzw:test-overwrite
+          echo "FIRST_EXIT=$?"
+
+      - name: 第二次推送（不同镜像 busybox -> 同一 tag，测试覆盖）
+        id: second
+        continue-on-error: true
+        run: |
+          skopeo copy docker://docker.io/library/busybox:latest \
+            docker://${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/zwzw:test-overwrite
+          echo "SECOND_EXIT=$?"
+
+      - name: 校验覆盖结果（读取该 tag 的镜像标识）
+        run: |
+          echo "=== 覆盖后 tag 指向的内容 ==="
+          skopeo inspect --raw docker://${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/zwzw:test-overwrite 2>/dev/null | head -c 300 || true
