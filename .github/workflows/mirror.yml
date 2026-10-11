@@ -72,8 +72,8 @@ jobs:
           DEST: docker://${{ steps.ref.outputs.dest }}
         run: |
           echo "Copy: $SRC -> $DEST"
-          # 捕获 skopeo 错误日志，失败时随回调带回，便于前端展示真实原因；--retry-times 应对上游瞬时抖动
-          if ! skopeo copy --retry-times 3 --retry-delay 5 "$SRC" "$DEST" 2> skopeo_err.log; then
+          # 捕获 skopeo 错误日志，失败时随回调带回，便于前端展示真实原因；--retry-times 应对上游瞬时抖动（旧版 skopeo 不支持 --retry-delay，故省略）
+          if ! skopeo copy --retry-times 3 "$SRC" "$DEST" 2> skopeo_err.log; then
             ERR_LINE=$(tail -n 5 skopeo_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
             echo "SKOPEO_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
             exit 1
