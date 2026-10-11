@@ -1,0 +1,113 @@
+name: Mirror Docker Image
+
+# 由 Cloudflare Workers 通过 workflow_dispatch 触发
+#  inputs:
+#   source_registry : 上游 registry（如 docker.io / ghcr.io / quay.io）
+#   image_name      : 上游镜像名（如 library/nginx / bitnami/nginx / nginx）
+#   image_ref       : Tag（如 latest）或 digest（sha256:...）
+#   acr_repo        : 目标 ACR 仓库路径（含源别名前缀，如 dockerhub/library/nginx / ghcr/nginx）
+on:
+  workflow_dispatch:
+    inputs:
+      source_registry:
+        description: '上游 registry，如 docker.io / ghcr.io / quay.io'
+        required: true
+      image_name:
+        description: '上游镜像名，如 library/nginx 或 bitnami/nginx 或 nginx'
+        required: true
+      image_ref:
+        description: 'Tag（如 latest）或 digest（sha256:...）'
+        required: true
+      acr_repo:
+        description: '目标 ACR 仓库路径（含源别名前缀）'
+        required: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 安装依赖 (skopeo / jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: 构造源/目标引用
+        id: ref
+        env:
+          REF: ${{ github.event.inputs.image_ref }}
+          SRC_REG: ${{ github.event.inputs.source_registry }}
+          NAME: ${{ github.event.inputs.image_name }}
+          ACR_REPO: ${{ github.event.inputs.acr_repo }}
+          REG: ${{ secrets.ACR_REGISTRY }}
+          NS: ${{ secrets.ACR_NAMESPACE }}
+        run: |
+          if [[ "$REF" == sha256:* ]]; then SEP="@"; else SEP=":"; fi
+          echo "src=${SRC_REG}/${NAME}${SEP}${REF}"        >> "$GITHUB_OUTPUT"
+          echo "dest=${REG}/${NS}/${ACR_REPO}${SEP}${REF}" >> "$GITHUB_OUTPUT"
+          echo "sep=${SEP}"                                >> "$GITHUB_OUTPUT"
+
+      - name: 登录阿里云 ACR
+        run: |
+          skopeo login "${{ secrets.ACR_REGISTRY }}" \
+            --username "${{ secrets.ACR_USERNAME }}" \
+            --password "${{ secrets.ACR_PASSWORD }}"
+
+      - name: 转存镜像 (skopeo copy)
+        id: copy
+        continue-on-error: true
+        env:
+          SRC: docker://${{ steps.ref.outputs.src }}
+          DEST: docker://${{ steps.ref.outputs.dest }}
+        run: |
+          echo "Copy: $SRC -> $DEST"
+          skopeo copy "$SRC" "$DEST"
+
+      - name: 收集 blob digest 列表
+        if: steps.copy.outcome == 'success'
+        id: blobs
+        env:
+          SRC: docker://${{ steps.ref.outputs.src }}
+        run: |
+          DIGESTS=$(skopeo inspect --raw "$SRC" \
+            | jq -r '.. | objects | .digest? // empty' | sort -u)
+          {
+            echo "digests<<EOF"
+            echo "$DIGESTS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 回调 Workers（成功 -> ready）
+        if: steps.copy.outcome == 'success'
+        env:
+          URL: ${{ secrets.CALLBACK_URL }}
+          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+          ACR_REPO: ${{ github.event.inputs.acr_repo }}
+          REF: ${{ github.event.inputs.image_ref }}
+          DIGESTS: ${{ steps.blobs.outputs.digests }}
+        run: |
+          BLOBS_JSON=$(jq -R -s 'split("\n") | map(select(length>0))' <<< "$DIGESTS")
+          curl -s -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Token: $TOKEN" \
+            -d "$(jq -n \
+                  --arg repo "$ACR_REPO" \
+                  --arg ref "$REF" \
+                  --argjson blobs "$BLOBS_JSON" \
+                  '{acr_repo:$repo, image_ref:$ref, status:"ready", blobs:$blobs}')"
+
+      - name: 回调 Workers（失败 -> pending 重置）
+        if: steps.copy.outcome == 'failure'
+        env:
+          URL: ${{ secrets.CALLBACK_URL }}
+          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+          ACR_REPO: ${{ github.event.inputs.acr_repo }}
+          REF: ${{ github.event.inputs.image_ref }}
+        run: |
+          curl -s -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Token: $TOKEN" \
+            -d "$(jq -n \
+                  --arg repo "$ACR_REPO" \
+                  --arg ref "$REF" \
+                  '{acr_repo:$repo, image_ref:$ref, status:"pending"}')"
