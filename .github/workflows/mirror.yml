@@ -72,7 +72,12 @@ jobs:
           DEST: docker://${{ steps.ref.outputs.dest }}
         run: |
           echo "Copy: $SRC -> $DEST"
-          skopeo copy "$SRC" "$DEST"
+          # 捕获 skopeo 错误日志，失败时随回调带回，便于前端展示真实原因；--retry-times 应对上游瞬时抖动
+          if ! skopeo copy --retry-times 3 --retry-delay 5 "$SRC" "$DEST" 2> skopeo_err.log; then
+            ERR_LINE=$(tail -n 5 skopeo_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
+            echo "SKOPEO_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
       - name: 收集完整 digest 列表（index -> 平台 manifest -> layer/config）
         if: steps.copy.outcome == 'success'
@@ -125,13 +130,14 @@ jobs:
                   --argjson blobs "$BLOBS_JSON" \
                   '{acr_repo:$repo, image_ref:$ref, status:"ready", blobs:$blobs}')"
 
-      - name: 回调 Workers（失败 -> pending 重置）
+      - name: 回调 Workers（失败 -> failed，携带原因）
         if: failure()
         env:
           URL: ${{ secrets.CALLBACK_URL }}
           TOKEN: ${{ secrets.CALLBACK_TOKEN }}
           ACR_REPO: ${{ github.event.inputs.acr_repo }}
           REF: ${{ github.event.inputs.image_ref }}
+          ERR: ${{ steps.copy.outputs.SKOPEO_ERR }}
         run: |
           curl -s -X POST "$URL" \
             -H "Content-Type: application/json" \
@@ -139,4 +145,5 @@ jobs:
             -d "$(jq -n \
                   --arg repo "$ACR_REPO" \
                   --arg ref "$REF" \
-                  '{acr_repo:$repo, image_ref:$ref, status:"pending"}')"
+                  --arg err "${ERR:-skopeo 转存失败（无详细日志）}" \
+                  '{acr_repo:$repo, image_ref:$ref, status:"failed", error:$err}')"
