@@ -1,334 +1,1345 @@
-name: Mirror Docker Image
-# 运行列表直接显示正在处理的镜像与去向：转存模式显示槽位 tag，打包下载模式显示「打包下载」
-# (download_only 可能是布尔或字符串，两种形态都兼容，避免外部触发方式不同导致判断失误)
-run-name: "${{ github.event.inputs.display_name }} -> ${{ (github.event.inputs.download_only == true || github.event.inputs.download_only == 'true') && '打包下载' || github.event.inputs.acr_tag }}"
+/**
+ * Docker 镜像自动转存 — Cloudflare Workers 转发服务
+ *
+ * 职责：
+ *   1. 解析 Docker Registry V2 请求(/v2/、manifests、blobs)
+ *   2. 解析镜像源(默认 Docker Hub；子路径前缀区分其它源，如 /ghcr/ -> ghcr.io)
+ *   3. 查询 KV 中的转存状态，决定返回 503(转存中)还是 307(重定向到 ACR)
+ *   4. 触发 GitHub Actions 转存(workflow_dispatch)
+ *   5. 接收 Actions 回调，更新 KV 状态
+ *
+ * 所有域名 / 仓库 / Token / 源映射 均通过外部变量注入，不在此硬编码。
+ */
 
-# 由 Cloudflare Workers 通过 workflow_dispatch 触发
-#   inputs:
-#   source_alias    : 源缩写(dockerhub / ghcr / quay ...)，用于 ACR 仓库命名
-#   source_registry : 上游 registry(如 docker.io / ghcr.io / quay.io)
-#   image_name      : 上游镜像名(如 library/nginx / bitnami/nginx / nginx)
-#   image_ref       : Tag(如 latest)或 digest(sha256:...)
-#   acr_repo        : 逻辑仓库标识(含源别名前缀，仅用于回调 KV key，如 dockerhub/library/nginx)
-#   acr_repo_name   : 单一物理 ACR 仓库名(所有镜像统一推送目标，由 Worker 的 ACR_REPO 注入)
-#   acr_tag         : 目标槽位 tag(如 image037)，由 Worker 分配；打包下载模式下传 'download'(不使用)
-#   display_name    : 运行列表展示名(含 tag；Docker Hub 不带 dockerhub/、library/ 前缀)
-#   download_only   : true = 打包下载模式(不转存 ACR)：GitHub 拉取镜像打成 tar 上传 Release 供下载，12 小时后自动删除；
-#                     false/省略 = 转存模式(skopeo copy 到 ACR，原有行为)
-on:
-  workflow_dispatch:
-    inputs:
-      source_registry:
-        description: '上游 registry，如 docker.io / ghcr.io / quay.io'
-        required: true
-      image_name:
-        description: '上游镜像名，如 library/nginx 或 bitnami/nginx 或 nginx'
-        required: true
-      image_ref:
-        description: 'Tag(如 latest)或 digest(sha256:...)'
-        required: true
-      acr_repo:
-        description: '逻辑仓库标识(含源别名前缀，仅用于回调 KV key)'
-        required: true
-      acr_repo_name:
-        description: '单一物理 ACR 仓库名(所有镜像统一推送目标)'
-        required: true
-      acr_tag:
-        description: '目标槽位 tag(如 image037)，由 Worker 分配'
-        required: true
-      display_name:
-        description: '运行列表展示名(含 tag；Docker Hub 不带 dockerhub/、library/ 前缀)'
-        required: false
-        default: ''
-      download_only:
-        description: '勾选后为「打包下载」模式：不转存 ACR，改为拉取镜像打成 tar 上传 Release 供下载(12 小时自动删除)'
-        required: false
-        default: false
-        type: boolean
+const STATUS = {
+  PENDING: 'pending',
+  SYNCING: 'syncing',
+  READY: 'ready',
+  FAILED: 'failed',
+};
 
-jobs:
-  # ---- 转存模式(默认)：skopeo copy DockerHub -> ACR ----
-  mirror:
-    if: github.event.inputs.download_only != true && github.event.inputs.download_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      # 用缓存安装 skopeo / jq：命中缓存时直接复用，跳过 apt-get update + 下载，显著缩短启动耗时
-      # 第三方 action 固定到 commit SHA(而非 tag)：防止 tag 被移改后供应链投毒/行为漂移
-      - name: 安装依赖 (skopeo / jq，带缓存)
-        uses: awalsh128/cache-apt-pkgs-action@4c82c3ccdc1344ee11e9775dbdbdf43aa8a5614e # v1.5.1
-        with:
-          packages: skopeo jq
-          version: 1.0
+// ---- 外部变量默认值(未配置/留空时自动生效，避免漏配导致功能异常)----
+const SLOT_CAPACITY_DEFAULT = 200;                     // 固定槽位数量上限(image001..imageN)
+const RATE_LIMIT_DEFAULT = 100;                        // Web 触发转存的每小时上限(显式 0 = 不限流)
+const GITHUB_REF_DEFAULT = 'main';                     // 触发 GitHub Actions 的分支
+const CAMOUFLAGE_URL_DEFAULT = 'https://www.bing.com'; // 启用密码后，非密码路径跳转的伪装链接
 
-      - name: 构造源/目标引用
-        id: ref
-        env:
-          REF: ${{ github.event.inputs.image_ref }}
-          SRC_REG: ${{ github.event.inputs.source_registry }}
-          NAME: ${{ github.event.inputs.image_name }}
-          ACR_REPO_NAME: ${{ github.event.inputs.acr_repo_name }}
-          ACR_TAG: ${{ github.event.inputs.acr_tag }}
-          REG: ${{ secrets.ACR_REGISTRY }}
-          NS: ${{ secrets.ACR_NAMESPACE }}
-        run: |
-          if [[ "$REF" == sha256:* ]]; then SEP="@"; else SEP=":"; fi
-          # 目标 tag 由 Worker 分配的固定槽位(image001..imageN)，直接复用
-          echo "src=${SRC_REG}/${NAME}${SEP}${REF}"            >> "$GITHUB_OUTPUT"
-          echo "dest=${REG}/${NS}/${ACR_REPO_NAME}:${ACR_TAG}" >> "$GITHUB_OUTPUT"
-          echo "tag=${ACR_TAG}"                                >> "$GITHUB_OUTPUT"
+// 解析文本型外部变量：未配置/留空 → 用默认值
+function strVar(raw, def) {
+  const s = String(raw === undefined || raw === null ? '' : raw).trim();
+  return s || def;
+}
+// 解析整数型外部变量：未配置/非法 → 用默认值；显式 0 → 返回 0(由调用方解释为「关闭/不限流」)
+function intVar(raw, def) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return def;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return def;
+  return n;
+}
+function slotCapacity(env) {
+  const n = intVar(env.SLOT_CAPACITY, SLOT_CAPACITY_DEFAULT);
+  return n > 0 ? n : SLOT_CAPACITY_DEFAULT;   // 0/非法值都回落到默认容量
+}
+function rateLimitPerHour(env) {
+  const n = intVar(env.RATE_LIMIT_PER_HOUR, RATE_LIMIT_DEFAULT);
+  return n > 0 ? n : 0;                       // 0/负数 = 不限流
+}
+function githubRef(env) {
+  return strVar(env.GITHUB_REF, GITHUB_REF_DEFAULT);
+}
+function camouflageUrl(env) {
+  const s = String(env.CAMOUFLAGE_URL || '').trim() || CAMOUFLAGE_URL_DEFAULT;
+  // Response.redirect 要求绝对地址：没写协议时补 https://
+  return /^https?:\/\//i.test(s) ? s : 'https://' + s.replace(/^\/+/, '');
+}
 
-      - name: 登录阿里云 ACR
-        run: |
-          skopeo login "${{ secrets.ACR_REGISTRY }}" \
-            --username "${{ secrets.ACR_USERNAME }}" \
-            --password "${{ secrets.ACR_PASSWORD }}"
+// HUB_DOMAIN 未配置时，自动使用「本次请求实际访问的主机名」：
+// 无论是 *.workers.dev 还是自定义域名都能自适应，部署后无需再回填域名。
+function hubDomain(env, url) {
+  const raw = String(env.HUB_DOMAIN || '').trim();
+  // 允许填完整地址(如 https://xxx.workers.dev)，这里只取主机部分
+  const host = raw.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  if (host) return host;
+  return (url && url.hostname) || '';
+}
+function hubBase(env, url) {
+  const proto = url && url.protocol ? url.protocol : 'https:';
+  return proto + '//' + hubDomain(env, url);
+}
 
-      # Docker Hub 登录为可选项：配置了 DOCKERHUB_USERNAME/PASSWORD 则登录(拉取限额从匿名提升到认证用户)；
-      # 未配置则走匿名拉取。两个 secret 需同时配置才生效，只配一个也按匿名处理。
-      - name: 登录 Docker Hub (可选，未配置则匿名)
-        env:
-          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DH_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
-        run: |
-          if [[ -n "$DH_USERNAME" && -n "$DH_PASSWORD" ]]; then
-            echo "已配置 Docker Hub 凭据，执行登录(认证用户拉取限额)"
-            skopeo login docker.io --username "$DH_USERNAME" --password "$DH_PASSWORD"
-          else
-            echo "未配置 Docker Hub 凭据，走匿名拉取"
-          fi
+// 转存任务超时阈值(workflow 的 job timeout-minutes 为 30)
+const STALE_MS = 35 * 60 * 1000;
+// 卡死兜底：syncing/pending 超过阈值仍未收到回调，标记为 failed，避免前端无限等待
+async function guardStale(kv, key, st) {
+  if (!st) return st;
+  if ((st.status === STATUS.SYNCING || st.status === STATUS.PENDING) && st.updated_at) {
+    if (Date.now() - st.updated_at > STALE_MS) {
+      const failed = {
+        status: STATUS.FAILED,
+        error: '转存超时：超过 ' + Math.round(STALE_MS / 60000) + ' 分钟未收到回调，可能上游失败或回调丢失',
+        updated_at: Date.now(),
+      };
+      await putStatus(kv, key, failed, 600);
+      return failed;
+    }
+  }
+  return st;
+}
 
-      - name: 转存镜像 (skopeo copy)
-        id: copy
-        env:
-          SRC: docker://${{ steps.ref.outputs.src }}
-          DEST: docker://${{ steps.ref.outputs.dest }}
-        run: |
-          echo "Copy: $SRC -> $DEST"
-          # 捕获 skopeo 错误日志，失败时随回调带回，便于前端展示真实原因；--retry-times 应对上游瞬时抖动(旧版 skopeo 不支持 --retry-delay，故省略)
-          if ! skopeo copy --retry-times 3 "$SRC" "$DEST" 2> skopeo_err.log; then
-            # 报错同时打到步骤日志(否则只进 skopeo_err.log，Actions 日志里看不到真实原因)
-            cat skopeo_err.log >&2 || true
-            ERR_LINE=$(tail -n 5 skopeo_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
-            echo "SKOPEO_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
+// 简单全局限流(保护 Actions 额度与 GitHub API 触发限额)：按小时桶计数，
+// 超过 RATE_LIMIT_PER_HOUR 即拒绝触发(未配置或 <=0 = 不限流)。
+// 只保护 /api/mirror(Web 触发入口)；docker pull 的 /v2 路径靠 syncing 状态天然去重，不限流。
+function rateLimitKeyOf() {
+  return 'rl:hour:' + Math.floor(Date.now() / 3600000);
+}
+async function checkRateLimit(env) {
+  const limit = rateLimitPerHour(env);
+  if (limit <= 0) return { ok: true };
+  const key = rateLimitKeyOf();
+  const raw = await env.DOCKER_KV.get(key);
+  const used = raw ? (parseInt(raw, 10) || 0) : 0;
+  if (used >= limit) return { ok: false, used, limit };
+  await env.DOCKER_KV.put(key, String(used + 1), { expirationTtl: 3600 });
+  return { ok: true, used: used + 1, limit };
+}
 
-      - name: 收集完整 digest 列表(index -> 平台 manifest -> layer/config)
-        if: steps.copy.outcome == 'success'
-        id: blobs
-        env:
-          SRC: ${{ steps.ref.outputs.src }}
-          SRC_REG: ${{ github.event.inputs.source_registry }}
-          NAME: ${{ github.event.inputs.image_name }}
-        run: |
-          TOP=$(skopeo inspect --raw "docker://$SRC" 2>/dev/null)
-          # 顶层：index 取各平台 manifest digest；单架构取 layer/config digest
-          DIGESTS=$(echo "$TOP" | jq -r '
-            if (.manifests | type) == "array" then
-              .manifests[].digest
-            else
-              (.layers[]? | .digest // empty), (.config.digest // empty)
-            end' 2>/dev/null)
+// ---- 镜像源映射(脚本内置常量，极少变更；如需增删源直接改这里)----
+// 键为子路径前缀，值为对应的上游 registry。
+// 默认源(无前缀)走 docker.io，DEFAULT_SOURCE_ALIAS 仅用于 ACR 仓库命名，避免跨源冲突。
+const SOURCE_MAP = {
+  ghcr: 'ghcr.io',
+  quay: 'quay.io',
+  gcr: 'gcr.io',
+  k8s: 'registry.k8s.io',
+  mcr: 'mcr.microsoft.com',
+  ecr: 'public.ecr.aws',
+};
+const DEFAULT_SOURCE_ALIAS = 'dockerhub';
+const DEFAULT_REGISTRY = 'docker.io';
+// 转存前镜像状态的备份前缀(用于覆盖转存失败时恢复旧镜像)
+const BACKUP_PREFIX = 'backup:';
+// blob 反向索引的 TTL(90 天)：被轮换覆盖的镜像其索引会自动过期，避免 KV 无限增长；
+// 命中时会在 handleBlob 中续期，因此长期有人拉取的镜像不会失效。
+const BLOB_INDEX_TTL = 60 * 60 * 24 * 90;
+// blob 索引键：新格式为单集合键 blobset:<ACR_REPO>(digest 数组，一次写完)。
+// 原因：大镜像(多架构 × 多层)逐条写 blob:<digest> 时，每次 KV 写算 1 次 subrequest，
+// Free 计划 50 次/请求的上限会写不完索引 → 客户端拉层 503 且 docker 不重试 → 卡死。
+// 旧格式单条键保留兼容读取(回退)，不再新写。
+const BLOBSET_PREFIX = 'blobset:';
+const BLOB_KEY_PREFIX = 'blob:';
+function blobSetKeyOf(env) { return BLOBSET_PREFIX + env.ACR_REPO; }
+function blobKeyOf(env, digest) { return BLOB_KEY_PREFIX + env.ACR_REPO + ':' + digest; }
 
-          # 多架构：下钻每个平台 manifest，收集其 layer/config digest
-          if echo "$TOP" | jq -e '(.manifests | type) == "array"' >/dev/null 2>&1; then
-            for d in $(echo "$TOP" | jq -r '.manifests[].digest'); do
-              PLAT=$(skopeo inspect --raw "docker://${SRC_REG}/${NAME}@${d}" 2>/dev/null)
-              DIGESTS="$DIGESTS"$'\n'"$(echo "$PLAT" | jq -r '(.layers[]? | .digest // empty), (.config.digest // empty)' 2>/dev/null)"
-            done
-          fi
+// ---- 打包下载模式(Web 勾选后不转存 ACR：GitHub 拉取镜像打 tar 上传 Release，12 小时有效期)----
+// 状态键加 dl: 前缀，与转存模式的 <repo>:<ref> 完全隔离：下载模式不写槽位/blob 索引，
+// 也不会让 /v2 注册表路径误判为已转存(下载模式并没有推 ACR)。
+const DL_KEY_PREFIX = 'dl:';
+const DOWNLOAD_TTL_MS = 12 * 60 * 60 * 1000;   // 打包文件有效期 12 小时(与 cleanup-downloads.yml 清理阈值一致)
+const DOWNLOAD_GRACE_MS = 60 * 60 * 1000;      // KV 多保留 1 小时：到期后仍可向用户展示「已过期」而非直接消失
+function downloadKeyOf(acrRepo, reference) { return DL_KEY_PREFIX + acrRepo + ':' + reference; }
+// ready 但已过有效期(文件已被定时任务删除)：视为不存在，允许重新打包
+function isDownloadExpired(st) {
+  return !!(st && st.mode === 'download' && st.expires_at && Date.now() > st.expires_at);
+}
 
-          DIGESTS=$(echo "$DIGESTS" | sort -u | sed '/^$/d')
-          {
-            echo "digests<<EOF"
-            echo "$DIGESTS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+// registry 域名 -> 源别名(反向索引，用于识别 ghcr.io/xxx 这类标准写法)
+function aliasOfRegistry(reg) {
+  for (const alias in SOURCE_MAP) {
+    if (SOURCE_MAP[alias] === reg) return alias;
+  }
+  return reg === DEFAULT_REGISTRY ? DEFAULT_SOURCE_ALIAS : null;
+}
 
-      - name: 回调 Workers(成功 -> ready)
-        if: success()
-        env:
-          URL: ${{ secrets.CALLBACK_URL }}
-          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
-          ACR_REPO: ${{ github.event.inputs.acr_repo }}
-          REF: ${{ github.event.inputs.image_ref }}
-          DIGESTS: ${{ steps.blobs.outputs.digests }}
-        run: |
-          BLOBS_JSON=$(jq -R -s 'split("\n") | map(select(length>0))' <<< "$DIGESTS")
-          curl -s -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Callback-Token: $TOKEN" \
-            -d "$(jq -n \
-                  --arg repo "$ACR_REPO" \
-                  --arg ref "$REF" \
-                  --argjson blobs "$BLOBS_JSON" \
-                  '{acr_repo:$repo, image_ref:$ref, status:"ready", blobs:$blobs}')"
+// 首段是否为 registry 域名(Docker 官方规则：含 '.' 或 ':' ，或为 localhost)
+function isRegistryDomain(s) {
+  return s === 'localhost' || s.includes('.') || s.includes(':');
+}
 
-      - name: 回调 Workers(失败 -> failed，携带原因)
-        if: failure()
-        env:
-          URL: ${{ secrets.CALLBACK_URL }}
-          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
-          ACR_REPO: ${{ github.event.inputs.acr_repo }}
-          REF: ${{ github.event.inputs.image_ref }}
-          ERR: ${{ steps.copy.outputs.SKOPEO_ERR }}
-        run: |
-          curl -s -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Callback-Token: $TOKEN" \
-            -d "$(jq -n \
-                  --arg repo "$ACR_REPO" \
-                  --arg ref "$REF" \
-                  --arg err "${ERR:-skopeo 转存失败(无详细日志)}" \
-                  '{acr_repo:$repo, image_ref:$ref, status:"failed", error:$err}')"
+// 解析镜像源与镜像名
+// rawName 例如: "nginx" / "library/nginx" / "bitnami/nginx" / "ghcr/owner/repo" / "ghcr.io/owner/repo"
+function resolveSource(rawName) {
+  const parts = rawName.split('/');
+  const maybeAlias = parts[0];
 
-  # ---- 打包下载模式：不转存 ACR，拉取 -> tar -> Release 资产 -> 回调下载地址 ----
-  # 产物以 Release 资产形式分发(URL 稳定、可直接拼 ghproxy 等加速源)；
-  # 12 小时过期由同仓库 cleanup-downloads.yml 定时删除 dl-* Release 实现(删 Release 即删资产、释放存储)。
-  package:
-    if: github.event.inputs.download_only == true || github.event.inputs.download_only == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write   # 用内置 GITHUB_TOKEN 创建 Release 并上传打包文件
-    steps:
-      - name: 安装依赖 (skopeo / jq，带缓存)
-        uses: awalsh128/cache-apt-pkgs-action@4c82c3ccdc1344ee11e9775dbdbdf43aa8a5614e # v1.5.1
-        with:
-          packages: skopeo jq
-          version: 1.0
+  // 1) 兼容子路径别名前缀写法：ghcr/owner/repo
+  if (SOURCE_MAP[maybeAlias]) {
+    // 命中子路径前缀：使用对应上游 registry，不做 library/ 补全
+    return {
+      alias: maybeAlias,
+      registry: SOURCE_MAP[maybeAlias],
+      imageName: parts.slice(1).join('/'),
+    };
+  }
 
-      # Docker Hub 登录为可选项：配置了凭据则登录，未配置走匿名拉取(与转存模式一致)
-      - name: 登录 Docker Hub (可选，未配置则匿名)
-        env:
-          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DH_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
-        run: |
-          if [[ -n "$DH_USERNAME" && -n "$DH_PASSWORD" ]]; then
-            echo "已配置 Docker Hub 凭据，执行登录(认证用户拉取限额)"
-            skopeo login docker.io --username "$DH_USERNAME" --password "$DH_PASSWORD"
-          else
-            echo "未配置 Docker Hub 凭据，走匿名拉取"
-          fi
+  if (maybeAlias === DEFAULT_SOURCE_ALIAS) {
+    // 用户显式写了默认源前缀(如 dockerhub/library/nginx)：去掉前缀，按 Docker Hub 处理，避免重复叠加
+    const rest = parts.slice(1).join('/');
+    let imageName = rest || 'library';
+    if (!rest.includes('/')) imageName = 'library/' + rest;
+    return { alias: DEFAULT_SOURCE_ALIAS, registry: DEFAULT_REGISTRY, imageName };
+  }
 
-      - name: 构造源引用与文件名
-        id: ref
-        env:
-          REF: ${{ github.event.inputs.image_ref }}
-          SRC_REG: ${{ github.event.inputs.source_registry }}
-          NAME: ${{ github.event.inputs.image_name }}
-          DISPLAY: ${{ github.event.inputs.display_name }}
-        run: |
-          if [[ "$REF" == sha256:* ]]; then SEP="@"; else SEP=":"; fi
-          echo "src=${SRC_REG}/${NAME}${SEP}${REF}" >> "$GITHUB_OUTPUT"
-          # 展示名(Docker Hub 已去 library/ 前缀)，Worker 总会下发；缺失时用 名称+ref 兜底
-          if [[ -z "$DISPLAY" ]]; then DISPLAY="${NAME}${SEP}${REF}"; fi
-          # docker-archive 引用：digest 引用去掉 @sha256:...，避免路径/引用解析歧义
-          if [[ "$REF" == sha256:* ]]; then AREF="${DISPLAY%%@*}"; else AREF="$DISPLAY"; fi
-          # 文件名只保留安全字符(/ : @ 等替换为 -)
-          SAFE=$(printf '%s' "$DISPLAY" | tr '/:@' '---' | tr -cd '[:alnum:]._-')
-          echo "aref=${AREF}" >> "$GITHUB_OUTPUT"
-          echo "safe=${SAFE}" >> "$GITHUB_OUTPUT"
-          echo "file=${SAFE}.tar" >> "$GITHUB_OUTPUT"
+  // 3) 标准 docker pull 写法中的 registry 域名：ghcr.io/owner/repo、quay.io/x/y、docker.io/library/nginx
+  //    必须在此识别，否则 "ghcr.io/owner/repo" 会被当成 Docker Hub 镜像名而错误叠加成 docker.io/ghcr.io/...
+  if (parts.length > 1 && isRegistryDomain(maybeAlias)) {
+    const imageName = parts.slice(1).join('/');
+    if (maybeAlias === DEFAULT_REGISTRY) {
+      // docker.io/library/nginx -> 归一为 Docker Hub，并按需补全 library/
+      let name = imageName;
+      if (!name.includes('/')) name = 'library/' + name;
+      return { alias: DEFAULT_SOURCE_ALIAS, registry: DEFAULT_REGISTRY, imageName: name };
+    }
+    // 已知域名取对应别名；未知域名(私有仓库)直接用域名本身作为别名与 registry
+    const alias = aliasOfRegistry(maybeAlias) || maybeAlias;
+    return { alias, registry: maybeAlias, imageName };
+  }
 
-      - name: 拉取镜像并打包为 tar (docker load 兼容)
-        id: pkg
-        env:
-          SRC: docker://${{ steps.ref.outputs.src }}
-          FILE: ${{ steps.ref.outputs.file }}
-          AREF: ${{ steps.ref.outputs.aref }}
-        run: |
-          echo "Package: $SRC -> $FILE (load tag: $AREF)"
-          df -h . || true
-          # 优先 docker-archive：直接产出 docker load 兼容的单文件 tar
-          if skopeo copy --retry-times 3 "$SRC" "docker-archive:$PWD/$FILE:$AREF" 2> skopeo_err.log; then
-            echo "format=docker-archive" >> "$GITHUB_OUTPUT"
-          elif skopeo copy --retry-times 3 "$SRC" "dir:$PWD/img" 2> skopeo_err.log; then
-            # 兜底(个别多架构镜像 docker-archive 不支持)：打成 OCI 目录 tar，需用 skopeo/ctr 加载
-            tar -cf "$FILE" -C "$PWD/img" .
-            echo "format=oci-dir" >> "$GITHUB_OUTPUT"
-          else
-            # 报错同时打到步骤日志(否则只进 skopeo_err.log，Actions 日志里看不到真实原因)
-            cat skopeo_err.log >&2 || true
-            ERR_LINE=$(tail -n 5 skopeo_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
-            echo "PKG_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          echo "size=$(stat -c%s "$FILE")" >> "$GITHUB_OUTPUT"
-          echo "sha256=$(sha256sum "$FILE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+  // 4) 默认 Docker Hub：单段名补全 library/ 前缀
+  let imageName = rawName;
+  if (!rawName.includes('/')) imageName = 'library/' + rawName;
+  return { alias: DEFAULT_SOURCE_ALIAS, registry: DEFAULT_REGISTRY, imageName };
+}
 
-      - name: 上传为 Release 资产并生成下载地址
-        id: rel
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}   # owner/repo：package job 不 checkout 代码，必须显式指定 --repo，否则 gh 因找不到 .git 而失败
-          FILE: ${{ steps.ref.outputs.file }}
-          DISPLAY: ${{ github.event.inputs.display_name }}
-          FORMAT: ${{ steps.pkg.outputs.format }}
-        run: |
-          # tag 统一 dl- 前缀：由 cleanup-downloads.yml 识别，12 小时后自动删除(释放资产存储)
-          TAG="dl-$(date -u +%Y%m%d-%H%M%S)-${{ github.run_id }}"
-          NOTES=$(printf '源镜像: %s\n打包时间(UTC): %s\n打包格式: %s\n有效期: 12 小时，到期自动删除\n本地加载: docker load -i %s\n' \
-            "$DISPLAY" "$(date -u '+%F %T')" "$FORMAT" "$FILE")
-          # --repo 显式指定目标仓库(不依赖本地 .git)，gh 才能创建 Release/读取资产下载地址
-          if ! gh release create --repo "$REPO" "$TAG" "$FILE" --title "$DISPLAY 打包下载" --notes "$NOTES" 2> gh_err.log; then
-            cat gh_err.log >&2 || true
-            ERR_LINE=$(tail -n 5 gh_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
-            echo "PKG_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          # 下载地址确定性构造，无需再调用 gh release view 轮询资产(GitHub API 字段为
-          # browser_download_url，易踩坑；且上传完成到资产索引就绪存在极短延迟)。
-          # 格式固定：https://github.com/<owner>/<repo>/releases/download/<tag>/<filename>
-          URL="https://github.com/${REPO}/releases/download/${TAG}/${FILE}"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
+// ---- 固定槽位(image001..imageN)映射 + 轮换覆盖 ----
+// 所有镜像统一推到单一 ACR 仓库(env.ACR_REPO)下的固定槽位 tag，避免 ACR 仓库数/标签无限增长。
+// 已映射的镜像复用原槽位；未映射且未满则顺序填充；已满则轮换覆盖最久远的槽位(round-robin)。
+const SLOT_META_KEY = 'slot:meta';
 
-      - name: 回调 Workers(成功 -> ready，带回下载地址)
-        if: success()
-        env:
-          URL: ${{ secrets.CALLBACK_URL }}
-          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
-          ACR_REPO: ${{ github.event.inputs.acr_repo }}
-          REF: ${{ github.event.inputs.image_ref }}
-          DL_URL: ${{ steps.rel.outputs.url }}
-          FILE: ${{ steps.ref.outputs.file }}
-          SIZE: ${{ steps.pkg.outputs.size }}
-          SHA: ${{ steps.pkg.outputs.sha256 }}
-          FORMAT: ${{ steps.pkg.outputs.format }}
-        run: |
-          # 有效期 12 小时(与 cleanup-downloads.yml 的清理阈值一致)
-          EXPIRES_MS=$(( ($(date -u +%s) + 43200) * 1000 ))
-          curl -s -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Callback-Token: $TOKEN" \
-            -d "$(jq -n \
-                  --arg repo "$ACR_REPO" \
-                  --arg ref "$REF" \
-                  --arg url "$DL_URL" \
-                  --arg fn "$FILE" \
-                  --arg sz "$SIZE" \
-                  --arg sha "$SHA" \
-                  --arg fmt "$FORMAT" \
-                  --argjson exp "$EXPIRES_MS" \
-                  '{acr_repo:$repo, image_ref:$ref, status:"ready", mode:"download",
-                    download_url:$url, file_name:$fn, file_size:($sz|tonumber),
-                    file_sha256:$sha, archive_format:$fmt, expires_at:$exp}')"
+function slotTagName(env, slot) {
+  const cap = slotCapacity(env);
+  const width = Math.max(3, String(cap).length);
+  return 'image' + String(slot).padStart(width, '0');
+}
+function mapKeyOf(k) { return 'map:' + k; }
+function slotKeyOf(i) { return 'slot:' + i; }
+// 触发锁：同一 key 的触发请求用短 TTL 键去重，压缩"并发首拉 → 双触发 workflow"的窗口。
+// KV 无 CAS 语义，属尽力而为(与 syncing 状态组成双保险)；残留竞态窗口毫秒级，
+// 且重复触发结果无害(同槽位覆盖写、回调幂等)。
+const TRIGGER_LOCK_TTL = 120;
+function triggerLockKeyOf(key) { return 'lock:' + key; }
 
-      - name: 回调 Workers(失败 -> failed，携带原因)
-        if: failure()
-        env:
-          URL: ${{ secrets.CALLBACK_URL }}
-          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
-          ACR_REPO: ${{ github.event.inputs.acr_repo }}
-          REF: ${{ github.event.inputs.image_ref }}
-          ERR: ${{ steps.pkg.outputs.PKG_ERR }}${{ steps.rel.outputs.PKG_ERR }}
-        run: |
-          curl -s -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Callback-Token: $TOKEN" \
-            -d "$(jq -n \
-                  --arg repo "$ACR_REPO" \
-                  --arg ref "$REF" \
-                  --arg err "${ERR:-镜像打包失败(无详细日志)}" \
-                  '{acr_repo:$repo, image_ref:$ref, status:"failed", mode:"download", error:$err}')"
+async function getSlotMeta(env) {
+  const m = await getStatus(env.DOCKER_KV, SLOT_META_KEY);
+  if (m) return m;
+  return { capacity: slotCapacity(env), pointer: 1, size: 0 };
+}
+
+// 分配/复用槽位，返回槽位号(1-based)。维护 map 与反向索引，轮换时失效被覆盖镜像的 tag 级缓存。
+// 并发保护：KV 无事务，两个不同镜像同时首次分配可能选中同一槽位(都读到同一 size)。
+// 写完 slot:<i> 后回读校验：若已被他人覆盖，撤销本次 map 并重试(有界)，
+// 把「两个镜像共用一个槽位 → 一方 307 到别人的镜像内容」的窗口压到毫秒级。
+// 残余风险：KV 无 CAS，极端并发下仍可能双方都校验通过；要彻底消除需引入 Durable Object 串行化。
+async function allocateSlot(env, logicalKey, attempt) {
+  if (attempt === undefined) attempt = 0;
+  const existing = await env.DOCKER_KV.get(mapKeyOf(logicalKey));
+  if (existing !== null) return parseInt(existing, 10);
+  const meta = await getSlotMeta(env);
+  let slot;
+  if (meta.size < meta.capacity) {
+    slot = meta.size + 1;        // 1-based 顺序填充
+    meta.size = slot;
+  } else {
+    slot = meta.pointer;         // 轮换覆盖最久远的槽位
+    const oldKey = await env.DOCKER_KV.get(slotKeyOf(slot));
+    if (oldKey) {
+      await env.DOCKER_KV.delete(mapKeyOf(oldKey));  // 失效被覆盖镜像的映射
+      await env.DOCKER_KV.delete(oldKey);             // 失效其 tag 级 ready(digest 级仍按 digest 寻址，安全)
+    }
+    meta.pointer = (meta.pointer % meta.capacity) + 1;
+  }
+  await env.DOCKER_KV.put(mapKeyOf(logicalKey), String(slot));
+  await env.DOCKER_KV.put(slotKeyOf(slot), logicalKey);
+  await putSlotMeta(env, meta);
+  // 回读校验：slot:<i> 必须仍指向本 key，否则说明并发撞车
+  const verify = await env.DOCKER_KV.get(slotKeyOf(slot));
+  if (verify === logicalKey || attempt >= 3) return slot;
+  await env.DOCKER_KV.delete(mapKeyOf(logicalKey));  // 撤销本次分配，重试选下一个槽位
+  return allocateSlot(env, logicalKey, attempt + 1);
+}
+async function putSlotMeta(env, m) { await putStatus(env.DOCKER_KV, SLOT_META_KEY, m); }
+
+// 释放槽位：新增转存失败时调用，避免失败任务占用 imageXXX 序号。
+// 仅当该槽位是最后分配的(顺序填充的末尾)才回收序号，避免打乱轮换指针。
+async function releaseSlot(env, logicalKey) {
+  const raw = await env.DOCKER_KV.get(mapKeyOf(logicalKey));
+  if (raw === null) return;
+  const slot = parseInt(raw, 10);
+  await env.DOCKER_KV.delete(mapKeyOf(logicalKey));
+  const cur = await env.DOCKER_KV.get(slotKeyOf(slot));
+  if (cur === logicalKey) await env.DOCKER_KV.delete(slotKeyOf(slot));
+  const meta = await getSlotMeta(env);
+  if (meta.size === slot) meta.size = Math.max(0, slot - 1);
+  await putSlotMeta(env, meta);
+}
+
+// ---- 工具函数 ----
+
+function parseRegistryPath(pathname) {
+  const m = pathname.match(/^\/v2\/(.+)\/(manifests|blobs)\/(.+)$/);
+  if (!m) return null;
+  return { rawName: m[1], type: m[2], reference: m[3] };
+}
+
+// 所有镜像统一推到单一 ACR 仓库(env.ACR_REPO)，manifest 可按 tag 或按 digest 寻址
+function acrManifestUrl(env, ref) {
+  return `https://${env.ACR_REGISTRY}/v2/${env.ACR_NAMESPACE}/${env.ACR_REPO}/manifests/${ref}`;
+}
+
+function acrBlobUrl(env, digest) {
+  return `https://${env.ACR_REGISTRY}/v2/${env.ACR_NAMESPACE}/${env.ACR_REPO}/blobs/${digest}`;
+}
+
+// 取源仓库 manifest 的 Content-Type 与 Docker-Content-Digest：流式代理前必须知道类型
+// (单架构 vs 多架构 list)，否则 daemon 无法正确解析。做法：向源做一次轻量 GET(含 Bearer 鉴权流程)，
+// 结果缓存到 KV(1 天)以降低对源 registry 的访问与匿名限流压力。
+async function sourceManifestMeta(env, source, reference) {
+  const cacheKey = 'ct:' + source.registry + '/' + source.imageName + ':' + reference;
+  const cached = await env.DOCKER_KV.get(cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch { /* 损坏则用默认 */ }
+  }
+  const accept = [
+    'application/vnd.docker.distribution.manifest.v2+json',
+    'application/vnd.docker.distribution.manifest.list.v2+json',
+    'application/vnd.oci.image.index.v1+json',
+    'application/vnd.oci.image.manifest.v1+json',
+  ].join(',');
+  // Docker Hub 的 registry API 实际主机是 registry-1.docker.io(docker.io 仅用于展示/鉴权)
+  const host = source.registry === 'docker.io' ? 'registry-1.docker.io' : source.registry;
+  const url = `https://${host}/v2/${source.imageName}/manifests/${reference}`;
+  let ct = 'application/vnd.docker.distribution.manifest.v2+json';
+  let digest = '';
+  // 源拉取可能偶发慢/挂死：加 8s 超时，超时则回退默认(不阻塞拉取，避免 daemon 仍卡在等响应头)
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 8000);
+  try {
+    let r = await fetch(url, { headers: { Accept: accept }, signal: ac.signal });
+    if (r.status === 401) {
+      const a = parseBearerAuth(r.headers.get('WWW-Authenticate') || '');
+      if (a.realm) {
+        const tu = new URL(a.realm);
+        if (a.service) tu.searchParams.set('service', a.service);
+        if (a.scope) tu.searchParams.set('scope', a.scope);
+        const tr = await fetch(tu.toString(), { signal: ac.signal });
+        const tj = await tr.json().catch(() => null);
+        if (tj && tj.token) {
+          r = await fetch(url, { headers: { Accept: accept, Authorization: 'Bearer ' + tj.token }, signal: ac.signal });
+        }
+      }
+    }
+    if (r.ok) {
+      ct = r.headers.get('content-type') || ct;
+      digest = r.headers.get('docker-content-digest') || '';
+    }
+  } catch { /* 失败/超时则回退默认，不阻塞拉取 */ }
+  clearTimeout(timer);
+  const meta = { ct, digest };
+  await env.DOCKER_KV.put(cacheKey, JSON.stringify(meta), { expirationTtl: 86400 }).catch(() => {});
+  return meta;
+}
+
+function parseBearerAuth(h) {
+  const out = {};
+  const m = h.match(/Bearer\s+(.*)/i);
+  if (!m) return out;
+  for (const part of m[1].split(',')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const k = part.slice(0, eq).trim().toLowerCase();
+    let v = part.slice(eq + 1).trim();
+    if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+    out[k] = v;
+  }
+  return out;
+}
+
+// 流式代理 manifest：立即发 200 响应头(daemon 不再因等不到响应头而 timeout awaiting response headers)，
+// 连接保持；等转存就绪后从 ACR 取真实 manifest 并流式回传。等待上限 maxMs 用较长值(转存在 GitHub Actions
+// 异步跑，通常 1~3 分钟)，确保绝大多数转存能在同一条连接内完成、不断链。
+function manifestProxyStream(env, statusKey, isDigest, reference, maxMs) {
+  // ACR 的 manifest 接口与标准 Docker registry 一致：必须带 Accept 头，否则返回 404/空体。
+  // 注意 digest 那一步是 307 让 Docker 自己带 Accept 去拉(没问题)；唯独本函数代 Worker 拉 TAG
+  // manifest 时若漏掉 Accept，ACR 会拒绝 → 走入兜底错误体 → Docker 误解析成空 descriptor。
+  const ACR_ACCEPT = [
+    'application/vnd.docker.distribution.manifest.v2+json',
+    'application/vnd.docker.distribution.manifest.list.v2+json',
+    'application/vnd.oci.image.index.v1+json',
+    'application/vnd.oci.image.manifest.v1+json',
+  ].join(',');
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        const ready = await waitForReady(env, statusKey, isDigest ? reference : null, maxMs);
+        if (ready) {
+          const ref = isDigest ? reference : ready.acr_tag;
+          if (ref) {
+            // ACR 拉取加 30s 超时：就绪后 manifest 很小，超时即异常
+            const ac = new AbortController();
+            const at = setTimeout(() => ac.abort(), 30000);
+            let acrRes;
+            try {
+              acrRes = await fetch(acrManifestUrl(env, ref), {
+                headers: { Accept: ACR_ACCEPT },
+                signal: ac.signal,
+              });
+            }
+            finally { clearTimeout(at); }
+            if (acrRes && acrRes.ok && acrRes.body) {
+              const reader = acrRes.body.getReader();
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                controller.enqueue(value);
+              }
+              controller.close();
+              return;
+            }
+          }
+        }
+      } catch { /* 落到下方错误体 */ }
+      // 极少数：等待超时或 ACR 拉取失败(已远超正常转存时长)。已发 200 无法改 503，
+      // 写入一段非空的 registry 错误体(避免空体被 daemon 报 "content size of zero")，
+      // daemon 据此报错、用户重试即可(此时转存多半已完成)。
+      try {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+          errors: [{ code: 'UNAVAILABLE', message: '镜像转存仍在进行或暂不可用，请稍后重试' }],
+        })));
+      } catch {}
+      try { controller.close(); } catch {}
+    },
+  });
+}
+
+// 读取状态：手动解析并容忍损坏/空值，避免 KV 中个别值非法 JSON 导致整体 500。
+// 解析失败时当作“未缓存”返回 null，由上层逻辑重新触发或重定向，安全降级。
+async function getStatus(kv, key) {
+  const raw = await kv.get(key);
+  if (raw === null || raw === undefined) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function putStatus(kv, key, value, ttl) {
+  const opts = ttl ? { expirationTtl: ttl } : {};
+  await kv.put(key, JSON.stringify(value), opts);
+}
+
+// 单次触发 GitHub Actions 转存
+// downloadOnly=true 时附带 download_only 输入，workflow 走「打包下载」job；
+// 仅在为 true 时才传该输入：旧版 workflow(无此输入)不受影响，缺省即转存模式。
+async function triggerOnce(env, source, reference, acrRepo, acrTag, downloadOnly) {
+  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}` +
+    `/actions/workflows/${env.GITHUB_WORKFLOW_ID}/dispatches`;
+  let status = 0;
+  let detail = '';
+  const inputs = {
+    source_registry: source.registry,
+    image_name: source.imageName,
+    image_ref: reference,
+    acr_repo: acrRepo,
+    acr_repo_name: env.ACR_REPO,
+    acr_tag: acrTag,
+    display_name: buildDisplayName(source, reference),
+  };
+  if (downloadOnly) inputs.download_only = true;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'cloudflare-worker',
+      },
+      body: JSON.stringify({
+        ref: githubRef(env),
+        inputs,
+      }),
+    });
+    status = res.status;
+    if (!res.ok) {
+      try { detail = (await res.json()).message || (await res.text()); } catch { detail = await res.text().catch(() => ''); }
+    }
+    return { ok: res.ok, status, detail };
+  } catch (e) {
+    return { ok: false, status: 0, detail: String(e && e.message || e) };
+  }
+}
+
+// 触发 GitHub Actions 转存(带快速重试)：仅对瞬时错误(网络错误 / 5xx / 408 / 429)重试，
+// 4xx(参数或权限问题，如 PAT 无 actions:write)重试无意义，直接返回让用户看到原因。
+async function triggerSync(env, source, reference, acrRepo, acrTag, downloadOnly) {
+  const delays = [0, 1500, 4000];
+  let last = { ok: false, status: 0, detail: '' };
+  for (let i = 0; i < delays.length; i++) {
+    if (delays[i]) await sleep(delays[i]);
+    last = await triggerOnce(env, source, reference, acrRepo, acrTag, downloadOnly);
+    if (last.ok) return last;
+    const transient = last.status === 0 || last.status === 408 || last.status === 429 || last.status >= 500;
+    if (!transient) return last;
+  }
+  return last;
+}
+
+// 503 + Retry-After(方案 A+C：响应体带进度链接)
+function manifestPending(env, key, phase, triggerDetail, url) {
+  const progress = `${hubBase(env, url)}/status?key=${encodeURIComponent(key)}`;
+  const msg = `镜像转存中(${phase})，已触发 GitHub Actions 转存，请稍后重试。进度: ${progress}` +
+    (triggerDetail ? ` 触发详情: ${triggerDetail}` : '');
+  const body = JSON.stringify({
+    errors: [{
+      code: 'MANIFEST_UNKNOWN',
+      message: msg,
+    }],
+    progress,
+    trigger_detail: triggerDetail || undefined,
+  });
+  return new Response(body, {
+    status: 503,
+    headers: {
+      'Content-Type': 'application/json',
+      'Retry-After': '30',
+      'Docker-Distribution-Api-Version': 'registry/2.0',
+    },
+  });
+}
+
+function serviceUnavailable(message) {
+  return new Response(JSON.stringify({ errors: [{ code: 'UNAVAILABLE', message }] }), {
+    status: 503,
+    headers: {
+      'Content-Type': 'application/json',
+      'Retry-After': '30',
+      'Docker-Distribution-Api-Version': 'registry/2.0',
+    },
+  });
+}
+
+// ---- 处理器 ----
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// 等待转存完成：轮询 KV 直到 ready 或超时。
+// 等待期间几乎不消耗 CPU(I/O 等待不计入 CPU 时间)，但每次 KV 读取算一次 subrequest，
+// Free 计划单请求上限约 50 次，这是硬约束、优先保住。故采用更粗的递增轮询(10s→30s)：
+// 即便等待 10 分钟，也仅约 24 次读取，整条请求 subrequest 总数稳定在 ~46(远低于 50)。
+async function waitForReady(env, statusKey, digest, maxMs) {
+  const deadline = Date.now() + maxMs;
+  let interval = 10000;
+  for (;;) {
+    // 先立即检查一次再睡眠：已就绪时少等一个轮询周期(digest 请求常见)
+    const st = await getStatus(env.DOCKER_KV, statusKey);
+    if (st && st.status === STATUS.READY) {
+      // digest 请求还需确认该 digest 在已转存集合内，否则不必继续等
+      if (!digest || (Array.isArray(st.digests) && st.digests.includes(digest))) return st;
+      return null;
+    }
+    // 已失败/触发失败：继续等没有意义
+    if (st && (st.status === STATUS.FAILED || st.status === STATUS.PENDING)) return null;
+    const rest = deadline - Date.now();
+    if (rest <= 0) return null;
+    await sleep(Math.min(interval, rest));
+    // 粗粒度递增(10s→30s)：长等待时把 KV 读取次数压到最低，优先保住 Free 计划 50 subrequest/请求上限。
+    interval = Math.min(interval + 5000, 30000);
+  }
+}
+
+// SYNC_WAIT_MS：manifest 请求在转存未完成时最多原地等待多久(毫秒)，0 = 不等待直接返回 503。默认 120000
+function syncWaitMs(env) {
+  const raw = env.SYNC_WAIT_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return 120000;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+async function handleManifest(env, source, reference, key, acrRepo, url, method) {
+  const isDigest = reference.startsWith('sha256:');
+  // tag 请求按 key(repo:tag)判断；digest 请求按仓库级 ready + digest 集合判断
+  // (多架构镜像：客户端先按 tag 取 index，再按 digest 请求平台 manifest)
+  const statusKey = isDigest ? acrRepo : key;
+  let st = await getStatus(env.DOCKER_KV, statusKey);
+  // 卡死兜底：syncing/pending 超 35 分钟未收到回调 → 标记 failed(下次请求自愈重触发)，
+  // 避免每次 pull 都白等满 SYNC_WAIT_MS 才 503
+  st = await guardStale(env.DOCKER_KV, statusKey, st);
+
+  // 已转存：307 重定向到 ACR
+  if (st && st.status === STATUS.READY) {
+    if (!isDigest || (Array.isArray(st.digests) && st.digests.includes(reference))) {
+      // tag 请求 -> 重定向到固定槽位 tag；digest 请求 -> 按 digest 寻址(平台 manifest 按 digest 存入 ACR)
+      const ref = isDigest ? reference : st.acr_tag;
+      if (ref) return Response.redirect(acrManifestUrl(env, ref), 307);
+    }
+    // digest 不在本仓库已转存集合内，继续走触发
+  }
+
+  // 未在转存中(pending / 不存在 / 失败)：分配槽位、置 syncing 防重复触发，再触发 Actions
+  let triggerDetail = null;
+  let skipped = false; // true = 被触发锁去重(并发首拉)，本请求不承担触发职责，直接走等待
+  if (!(st && st.status === STATUS.SYNCING)) {
+    const locked = await env.DOCKER_KV.get(triggerLockKeyOf(key));
+    if (locked === null) {
+      await env.DOCKER_KV.put(triggerLockKeyOf(key), '1', { expirationTtl: TRIGGER_LOCK_TTL });
+      const slot = await allocateSlot(env, key);
+      const acrTag = slotTagName(env, slot);
+      await putStatus(env.DOCKER_KV, key, {
+        status: STATUS.SYNCING,
+        acr_repo: acrRepo,
+        acr_tag: acrTag,
+        updated_at: Date.now(),
+      }, 1800); // syncing 30 分钟 TTL，避免卡死
+
+      let triggerResult = { ok: false, status: 0, detail: '' };
+      try {
+        triggerResult = await triggerSync(env, source, reference, acrRepo, acrTag);
+      } catch {
+        triggerResult = { ok: false, status: 0, detail: 'exception' };
+      }
+      if (!triggerResult.ok) {
+        // 触发失败：立即释放本次占用的槽位，不占用 imageXXX 序号、不留下 map/slot 映射
+        await releaseSlot(env, key);
+        await putStatus(env.DOCKER_KV, key, {
+          status: STATUS.PENDING,
+          acr_repo: acrRepo,
+          acr_tag: acrTag,
+          updated_at: Date.now(),
+        }, 600);
+      }
+      triggerDetail = triggerResult.ok ? null : triggerResult.detail;
+    } else {
+      skipped = true;
+    }
+  }
+
+  // 未就绪：触发已完成，进入「流式代理」——立即发 200 响应头并保活连接，等转存就绪后从 ACR
+  // 取真实 manifest 流式回传。daemon 不会因等不到响应头而 timeout awaiting response headers，
+  // 真正满足「转存后不断链、继续拉取转存后的镜像」。trigger 失败或配置为不等待(waitMs<=0) 时走 503 兜底。
+  if (!triggerDetail && syncWaitMs(env) > 0) {
+    // HEAD 只需立刻 200 让 daemon 继续到 GET；无需拉源、无需等待、无 body(content-type 对 HEAD 无意义)，
+    // 这样 HEAD 绝不会因为等响应头而 timeout awaiting response headers。
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/vnd.docker.distribution.manifest.v2+json',
+          'Docker-Distribution-Api-Version': 'registry/2.0',
+        },
+      });
+    }
+    // GET：先从源取 content-type/digest 用于正确响应头(已缓存 1 天，正常 ~1~8s，失败回退默认)，
+    // 随后流式代理。等待上限设为 10 分钟，给转存充足时间在同一条连接内完成；轮询为粗粒度(10s→30s)，
+    // 10 分钟内仅约 24 次 KV 读取，整条请求 subrequest 总数稳在 ~46，远低于 Free 计划 50 次上限，优先保住配额。
+    const meta = await sourceManifestMeta(env, source, reference); // {ct, digest}
+    const hdrs = {
+      'Content-Type': meta.ct,
+      'Docker-Distribution-Api-Version': 'registry/2.0',
+    };
+    if (meta.digest) hdrs['Docker-Content-Digest'] = meta.digest;
+    const STREAM_CAP_MS = 600000; // 10 分钟：给长转存留足窗口，粗轮询下 subrequest 仍不超 50
+    return new Response(manifestProxyStream(env, statusKey, isDigest, reference, STREAM_CAP_MS), {
+      status: 200,
+      headers: hdrs,
+    });
+  }
+
+  // 503 兜底(触发失败 / 不等待模式)：相位提示回读当前状态
+  let phase = 'syncing';
+  if (triggerDetail) {
+    phase = 'pending(触发失败)';
+  } else if (skipped) {
+    const cur = await getStatus(env.DOCKER_KV, statusKey);
+    if (cur && cur.status) phase = String(cur.status);
+  }
+  return manifestPending(env, acrRepo, phase, triggerDetail || undefined, url);
+}
+
+async function handleBlob(env, digest, acrRepo) {
+  // blob 通过索引判断：仅当该 digest 确实已转存(在单一 ACR 仓库中)时才重定向。
+  // 新格式：单集合键 blobset:<ACR_REPO>(digest 数组)；旧格式：单条键 blob:<ACR_REPO>:<digest>(兼容回退)。
+  const setKey = blobSetKeyOf(env);
+  const legacyKey = blobKeyOf(env, digest);
+
+  async function check() {
+    const raw = await env.DOCKER_KV.get(setKey);
+    if (raw) {
+      try {
+        const set = JSON.parse(raw);
+        if (Array.isArray(set) && set.includes(digest)) return { raw, hit: true };
+      } catch { /* 集合值损坏：当作未命中，继续回退单条键 */ }
+    }
+    const legacy = await env.DOCKER_KV.get(legacyKey);
+    if (legacy) return { legacy, hit: true };
+    return { hit: false };
+  }
+
+  let r = await check();
+  if (!r.hit && acrRepo) {
+    // 回调先写 tag/仓库级 ready，再写 blob 索引，两者相差几十毫秒。
+    // 仓库刚就绪时短暂等待，规避客户端拿到 manifest 后首批 blob 命中空索引的竞态。
+    const st = await getStatus(env.DOCKER_KV, acrRepo);
+    if (st && st.status === STATUS.READY) {
+      const deadline = Date.now() + 8000;
+      while (!r.hit && Date.now() < deadline) {
+        await sleep(1000);
+        r = await check();
+      }
+    }
+  }
+  if (r.hit) {
+    // 命中后续期，保证长期有人拉取的镜像不会被 TTL 清掉(每次 blob 请求仅多 1~2 次 KV 写)
+    if (r.raw) await env.DOCKER_KV.put(setKey, r.raw, { expirationTtl: BLOB_INDEX_TTL });
+    if (r.legacy) await env.DOCKER_KV.put(legacyKey, r.legacy, { expirationTtl: BLOB_INDEX_TTL });
+    return Response.redirect(acrBlobUrl(env, digest), 307);
+  }
+  return serviceUnavailable('镜像层尚未转存完成，请稍后重试。');
+}
+
+// Actions 回调：更新 KV 状态(携带共享密钥校验)
+async function handleCallback(request, env) {
+  const token = request.headers.get('X-Callback-Token');
+  if (!token || token !== env.CALLBACK_TOKEN) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  let data;
+  try {
+    data = await request.json();
+  } catch {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  const { acr_repo, image_ref, status, blobs } = data;
+  if (!acr_repo || !image_ref || !status) {
+    return new Response('Missing fields', { status: 400 });
+  }
+
+  // ---- 打包下载模式回调：只写 dl: 状态(下载地址/有效期)，不占槽位、不写 blob 索引 ----
+  if (data.mode === 'download') {
+    const dlKey = downloadKeyOf(acr_repo, image_ref);
+    if (status === STATUS.READY) {
+      if (!data.download_url) {
+        await putStatus(env.DOCKER_KV, dlKey, {
+          status: STATUS.FAILED, mode: 'download', acr_repo,
+          error: '回调缺少 download_url', updated_at: Date.now(),
+        }, 600);
+        return new Response('Missing download_url', { status: 400 });
+      }
+      const expiresAt = Number.isFinite(data.expires_at) && data.expires_at > 0
+        ? data.expires_at
+        : Date.now() + DOWNLOAD_TTL_MS;
+      // KV TTL = 有效期 + 1 小时宽限：到期后短时间内仍可展示「已过期」，之后自动消失
+      const ttl = Math.max(60, Math.ceil((expiresAt + DOWNLOAD_GRACE_MS - Date.now()) / 1000));
+      try {
+        await putStatus(env.DOCKER_KV, dlKey, {
+          status: STATUS.READY,
+          mode: 'download',
+          acr_repo: acr_repo,
+          download_url: String(data.download_url).slice(0, 1000),
+          file_name: typeof data.file_name === 'string' ? data.file_name.slice(0, 200) : null,
+          file_size: Number.isFinite(data.file_size) ? data.file_size : null,
+          file_sha256: typeof data.file_sha256 === 'string' ? data.file_sha256.slice(0, 100) : null,
+          archive_format: typeof data.archive_format === 'string' ? data.archive_format.slice(0, 50) : null,
+          expires_at: expiresAt,
+          updated_at: Date.now(),
+        }, ttl);
+        return new Response('OK', { status: 200 });
+      } catch (e) {
+        return new Response('Partial: ' + String((e && e.message) || e), { status: 500 });
+      }
+    }
+    // 打包失败：记录原因(10 分钟 TTL，与转存失败一致)，显式提交即可重试
+    const dlErr = typeof data.error === 'string' ? data.error.slice(0, 500) : '镜像打包失败';
+    await putStatus(env.DOCKER_KV, dlKey, {
+      status: STATUS.FAILED, mode: 'download', acr_repo, error: dlErr, updated_at: Date.now(),
+    }, 600);
+    return new Response('Failed', { status: 200 });
+  }
+
+  const key = `${acr_repo}:${image_ref}`;
+
+  if (status === STATUS.READY) {
+    const digests = Array.isArray(blobs)
+      ? blobs.filter(d => typeof d === 'string' && d.startsWith('sha256:'))
+      : [];
+    // 回调时再次确认槽位(触发时已分配，这里幂等复用)，保证 tag 与 KV 一致
+    const slot = await allocateSlot(env, key);
+    const acrTag = slotTagName(env, slot);
+
+    // 每步独立容错：任一 KV 写失败不阻断其余写入，避免"仓库级 ready 没写上 → 反复重复转存"。
+    // 最终按关键写入完成情况返回(workflow 仅记录响应、不重试)。
+    let lastErr = null;
+    let okRepo = false;
+
+    // 1) 按引用(tag 或 digest)记录 ready(含槽位 tag)。
+    //    digest 形式的 key 轮换时不会被清(只清 tag 键)，故加 TTL 防只增；
+    //    到期后按 digest 再拉会重新转存并分配新槽位，可接受。
+    try {
+      const refTtl = image_ref.startsWith('sha256:') ? BLOB_INDEX_TTL : undefined;
+      await putStatus(env.DOCKER_KV, key, {
+        status: STATUS.READY,
+        acr_repo: acr_repo,
+        acr_tag: acrTag,
+        updated_at: Date.now(),
+      }, refTtl);
+    } catch (e) { lastErr = e; }
+
+    // 2) 仓库级 ready + 完整 digest 集合(供 digest 形式的 manifest 请求命中)
+    try {
+      await putStatus(env.DOCKER_KV, acr_repo, {
+        status: STATUS.READY,
+        acr_repo: acr_repo,
+        acr_tag: acrTag,
+        digests,
+        updated_at: Date.now(),
+      }, 60 * 60 * 24 * 7); // 仓库级 7 天，便于后续重复拉取直接重定向
+      okRepo = true;
+    } catch (e) { lastErr = e; }
+
+    // 3) blob 索引：所有镜像统一在单一 ACR 仓库(env.ACR_REPO)中，索引用单集合键一次写完
+    //    (与仓库已有集合合并：不同镜像/不同 tag 可能共享 layer digest)。
+    try {
+      const setKey = blobSetKeyOf(env);
+      const prevRaw = await env.DOCKER_KV.get(setKey);
+      let prev = [];
+      if (prevRaw) {
+        try { const p = JSON.parse(prevRaw); if (Array.isArray(p)) prev = p; } catch { /* 损坏则重建 */ }
+      }
+      const merged = Array.from(new Set(prev.concat(digests)));
+      await env.DOCKER_KV.put(setKey, JSON.stringify(merged), { expirationTtl: BLOB_INDEX_TTL });
+    } catch (e) { lastErr = e; }
+
+    if (okRepo) return new Response('OK', { status: 200 });
+    return new Response('Partial: ' + String((lastErr && lastErr.message) || lastErr), { status: 500 });
+  }
+
+  const errMsg = typeof data.error === 'string' ? data.error.slice(0, 500) : '转存失败';
+  const backupKey = BACKUP_PREFIX + key;
+  const backup = await getStatus(env.DOCKER_KV, backupKey);
+
+  // 覆盖已有镜像失败：恢复原有 ready 与槽位(旧镜像仍在、继续可拉取)，仅附带本次失败原因供界面提示
+  if (backup && backup.status === STATUS.READY) {
+    await putStatus(env.DOCKER_KV, key, {
+      ...backup,
+      updated_at: Date.now(),
+      last_error: errMsg,
+    });
+    await env.DOCKER_KV.delete(backupKey);
+    return new Response('Restored', { status: 200 });
+  }
+
+  // 新增转存失败：释放槽位(不占用 imageXXX 序号)，并记录失败原因
+  await releaseSlot(env, key);
+  await env.DOCKER_KV.delete(backupKey);
+  await putStatus(env.DOCKER_KV, key, {
+    status: STATUS.FAILED,
+    acr_repo: acr_repo,
+    error: errMsg,
+    updated_at: Date.now(),
+  }, 600);
+  return new Response('Failed', { status: 200 });
+}
+
+// ---- Web 操作界面(浏览器直接访问)----
+const HOME_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker 镜像转存代理</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 50%, #0ea5e9 100%);
+    color: #e2e8f0; display: flex; flex-direction: column; align-items: center;
+  }
+  .wrap { width: 100%; max-width: 680px; padding: 48px 20px 24px; flex: 1; }
+  .card {
+    background: rgba(15,23,42,.72); backdrop-filter: blur(10px);
+    border: 1px solid rgba(148,163,184,.18); border-radius: 16px;
+    padding: 28px; box-shadow: 0 20px 50px rgba(0,0,0,.35);
+  }
+  h1 { margin: 0 0 6px; font-size: 24px; font-weight: 700; letter-spacing:.5px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 20px; line-height: 1.7; }
+  .sub code { background: rgba(148,163,184,.15); padding: 1px 5px; border-radius: 4px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  input[type=text] {
+    flex: 1; min-width: 200px; padding: 12px 14px; font-size: 15px;
+    border: 1px solid rgba(148,163,184,.3); border-radius: 10px;
+    background: rgba(2,6,23,.6); color: #f1f5f9; outline: none;
+  }
+  input[type=text]:focus { border-color: #38bdf8; }
+  button.go {
+    padding: 12px 22px; font-size: 15px; font-weight: 600; border: 0; border-radius: 10px;
+    background: linear-gradient(135deg,#0ea5e9,#2563eb); color: #fff; cursor: pointer;
+    transition: transform .08s ease, filter .15s ease;
+  }
+  button.go:hover { filter: brightness(1.08); }
+  button.go:active { transform: translateY(1px); }
+  .opt { display: flex; align-items: center; gap: 8px; margin: 14px 2px 0; font-size: 14px; color: #cbd5e1; }
+  .opt input { width: 16px; height: 16px; accent-color: #38bdf8; }
+  #out { margin-top: 22px; }
+  .box {
+    border-radius: 12px; padding: 16px; font-size: 14px; line-height: 1.7;
+    border: 1px solid rgba(148,163,184,.2); background: rgba(2,6,23,.45);
+  }
+  .ok { border-color: rgba(34,197,94,.5); }
+  .wait { border-color: rgba(234,179,8,.5); }
+  .err { border-color: rgba(239,68,68,.5); }
+  .tag { display:inline-block; font-size:12px; padding:2px 8px; border-radius:999px; margin-bottom:8px; }
+  .tag.ok { background: rgba(34,197,94,.15); color:#4ade80; }
+  .tag.wait { background: rgba(234,179,8,.15); color:#facc15; }
+  .tag.err { background: rgba(239,68,68,.15); color:#f87171; }
+  .kv { color:#94a3b8; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; color:#e2e8f0; }
+  .copy {
+    margin-top:10px; padding:8px 14px; font-size:13px; border:1px solid rgba(56,189,248,.5);
+    border-radius:8px; background:transparent; color:#7dd3fc; cursor:pointer;
+  }
+  .copy:hover { background: rgba(56,189,248,.12); }
+  .spin { display:inline-block; width:14px;height:14px;border:2px solid rgba(250,204,21,.4); border-top-color:#facc15; border-radius:50%; animation:sp .7s linear infinite; vertical-align:-2px; margin-right:6px;}
+  @keyframes sp { to { transform: rotate(360deg); } }
+  footer { color:#94a3b8; font-size:12px; padding: 18px 0 26px; text-align:center; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Docker 镜像转存代理</h1>
+      <div class="sub">输入镜像(与 <code>docker pull</code> 写法一致，可加源前缀)。例如：<code>nginx:alpine</code>、<code>library/nginx:1.25</code>、<code>ghcr/nginx/nginx:latest</code>、<code>nginx@sha256:...</code><br>勾选「打包下载」则不转存，直接生成可 <code>docker load</code> 的 tar 文件下载(12 小时有效，到期自动删除)。</div>
+      <form id="f">
+        <div class="row">
+          <input id="img" type="text" placeholder="nginx:alpine" value="nginx:alpine" autocomplete="off" />
+          <button class="go" type="submit">转存 / 查询</button>
+        </div>
+        <label class="opt"><input id="force" type="checkbox" /> 强制更新(覆盖已有转存)</label>
+        <label class="opt"><input id="dl" type="checkbox" /> 打包下载(不转存，生成 tar 文件，12 小时后自动删除)</label>
+      </form>
+      <div id="out"></div>
+    </div>
+  </div>
+  <footer>Copyright ©2026 造物者W</footer>
+  <script>
+  var out = document.getElementById('out');
+  function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+  function fmtSize(n){ n=Number(n)||0; if(n<1024) return n+' B'; var u=['KB','MB','GB','TB'],i=-1; do{n/=1024;i++;}while(n>=1024&&i<u.length-1); return n.toFixed(1)+' '+u[i]; }
+  function fmtTime(ms){ if(!ms) return ''; var t=new Date(Number(ms)); function p(x){return String(x).padStart(2,'0');} return t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate())+' '+p(t.getHours())+':'+p(t.getMinutes()); }
+  function render(d){
+    if(d.error){ out.innerHTML = '<div class="box err"><span class="tag err">错误</span><br>'+esc(d.error)+'</div>'; return; }
+    if(d.status === 'expired'){
+      out.innerHTML = '<div class="box wait"><span class="tag wait">已过期</span><div class="kv" style="margin-top:6px">打包文件已超过 12 小时并被自动删除，请重新勾选「打包下载」提交。</div></div>';
+      return;
+    }
+    // 打包下载就绪：可点击下载 + 原始地址可见(便于复制去拼加速源)
+    if(d.status === 'ready' && d.mode === 'download'){
+      out.innerHTML = '<div class="box ok"><span class="tag ok">打包完成</span><br>'+
+        '<div class="kv">文件：'+esc(d.file_name||'image.tar')+(d.file_size?'('+fmtSize(d.file_size)+')':'')+'</div>'+
+        '<div class="kv" style="margin-top:8px">下载地址(点击下载，可复制去拼加速源)：</div>'+
+        '<a class="mono" style="color:#7dd3fc" href="'+esc(d.download_url)+'" target="_blank" rel="noopener">'+esc(d.download_url)+'</a>'+
+        '<div class="kv" style="margin-top:8px">本地加载：docker load -i '+esc(d.file_name||'image.tar')+'　·　有效期至 '+esc(fmtTime(d.expires_at))+'(本地时间)，到期自动删除</div>'+
+        '<button class="copy" data-copy="'+esc(d.download_url)+'">复制下载链接</button></div>';
+      bindCopy(); return;
+    }
+    if(d.status === 'ready'){
+      out.innerHTML = '<div class="box ok"><span class="tag ok">已就绪</span><br>'+
+        '<div class="kv">源镜像地址：</div><div class="mono">'+esc(d.source_address||d.pull_address)+'</div>'+
+        '<div class="kv" style="margin-top:8px">拉取命令：</div><div class="mono">'+esc(d.pull_command)+'</div>'+
+        (d.last_error?'<div class="kv" style="margin-top:8px;color:#f87171">覆盖更新失败，当前仍为旧镜像：'+esc(d.last_error)+'</div>':'')+
+        '<button class="copy" data-copy="'+esc(d.pull_command)+'">复制拉取命令</button></div>';
+      bindCopy(); return;
+    }
+    if(d.status === 'failed'){
+      out.innerHTML = '<div class="box err"><span class="tag err">转存失败</span><br>'+
+        '<div class="kv">'+esc(d.error||'转存失败')+'</div>'+
+        '<div class="kv" style="margin-top:8px">可修正镜像名或勾选「强制更新」后重新提交重试。</div></div>';
+      return;
+    }
+    var isDl = d.mode === 'download';
+    var label = d.status === 'syncing' ? (isDl ? '打包中' : '转存中') : (d.trigger_failed ? '触发失败' : '排队中');
+    var tip = d.trigger_failed ? ('<div class="kv" style="margin-top:6px">'+esc(d.trigger_error||'')+'</div>') : '<div class="kv" style="margin-top:6px">'+(isDl?'正在后台拉取镜像并打包为 tar 文件，完成后自动显示下载地址。':'正在后台转存，完成后下方自动显示拉取命令。')+'</div>';
+    out.innerHTML = '<div class="box wait"><span class="tag wait">'+label+'</span><span class="spin"></span>'+
+      '<div class="kv">状态：'+esc(d.status)+(d.key?'  ·  key: '+esc(d.key):'')+'</div>'+tip+'</div>';
+    if(!d.trigger_failed){
+      // 轮询间隔收紧到 1.5s(浏览器侧独立请求，无 Workers subrequest 上限顾虑)；
+      // 带 cache:'no-store' 防止浏览器/CDN 缓存返回旧状态，回调后更快反映 ready。
+      var timer = setInterval(function(){
+        fetch('__PREFIX__/status?key='+encodeURIComponent(d.key), {cache:'no-store'}).then(function(s){return s.json();}).then(function(st){
+          // 用轮询到的完整状态合并渲染：下载模式可拿到 download_url/expires_at，转存模式拿 last_error
+          if(st.status === 'ready'){ clearInterval(timer); render(Object.assign({}, d, st)); }
+          else if(st.status === 'failed'){ clearInterval(timer); render({status:'failed', error: st.error}); }
+          else if(st.status === 'expired'){ clearInterval(timer); render({status:'expired'}); }
+          else { out.querySelector('.box').innerHTML = '<span class="tag wait">'+label+'</span><span class="spin"></span><div class="kv">状态：'+(st.status||'pending')+'</div>'+tip; }
+        }).catch(function(){ /* ignore */ });
+      }, 1500);
+    }
+  }
+  function bindCopy(){ document.querySelectorAll('.copy').forEach(function(b){ b.addEventListener('click', function(){ navigator.clipboard.writeText(b.getAttribute('data-copy')); b.textContent='已复制 ✓'; setTimeout(function(){b.textContent='复制拉取命令';},1500); }); }); }
+  document.getElementById('f').addEventListener('submit', function(e){
+    e.preventDefault();
+    var image = document.getElementById('img').value.trim();
+    var force = document.getElementById('force').checked;
+    var dl = document.getElementById('dl').checked;
+    if(!image){ out.innerHTML = '<div class="box err"><span class="tag err">提示</span><br>请输入镜像名称</div>'; return; }
+    out.innerHTML = '<div class="box wait"><span class="spin"></span> 提交中…</div>';
+    fetch('__PREFIX__/api/mirror', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({image:image, force:force, download_only:dl})})
+      .then(function(r){ return r.json(); })
+      .then(function(d){ render(d); })
+      .catch(function(){ out.innerHTML = '<div class="box err"><span class="tag err">错误</span><br>请求失败</div>'; });
+  });
+  </script>
+</body>
+</html>`;
+
+// 解析用户输入的镜像引用为 rawName + reference
+function parseImageRef(input) {
+  input = input.trim();
+  let rawName, reference;
+  const at = input.indexOf('@');
+  if (at !== -1) {
+    rawName = input.slice(0, at);
+    reference = input.slice(at + 1);
+  } else {
+    const colon = input.lastIndexOf(':');
+    const slash = input.lastIndexOf('/');
+    if (colon !== -1 && colon > slash) {
+      rawName = input.slice(0, colon);
+      reference = input.slice(colon + 1);
+    } else {
+      rawName = input;
+      reference = 'latest';
+    }
+  }
+  return { rawName, reference };
+}
+
+// 构造面向用户的「代理拉取地址」：docker pull hub.918178.xyz/<源别名>/<镜像名>:<tag>
+// 仅用于 Web 展示与复制，docker 客户端实际仍走 /v2 代理重定向，不会暴露真实 ACR 地址。
+function buildHubPullAddress(env, source, imageName, reference, url) {
+  const pathPart = source.alias === DEFAULT_SOURCE_ALIAS
+    ? imageName.replace(/^library\//, '')   // Docker Hub 默认镜像省略 library/ 前缀，更贴近 docker pull 写法
+    : source.registry + '/' + imageName;    // 非 Docker Hub：保留原始 registry 域名前缀，尽量贴近源镜像链接
+  const sep = reference.startsWith('sha256:') ? '@' : ':';
+  return `${hubDomain(env, url)}/${pathPart}${sep}${reference}`;
+}
+
+// GitHub Actions 运行列表展示名：包含 tag；Docker Hub 不显示 dockerhub/ 与 library/ 前缀
+function buildDisplayName(source, reference) {
+  const name = source.alias === DEFAULT_SOURCE_ALIAS
+    ? source.imageName.replace(/^library\//, '')
+    : source.registry + '/' + source.imageName;
+  const sep = reference.startsWith('sha256:') ? '@' : ':';
+  return name + sep + reference;
+}
+
+// Web 接口：查询/触发转存并返回面向用户的 docker pull 地址
+// - 未强制更新且已存在：直接返回 ready(不重复转存)
+// - 未强制更新且不存在/转存中：触发或返回当前状态(前端轮询)
+// - 强制更新且已存在：复用原槽位覆盖式重新转存；不存在则正常转存
+async function handleMirrorApi(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return Response.json({ error: 'invalid json' }, { status: 400 }); }
+  const image = (body.image || '').trim();
+  if (!image) return Response.json({ error: 'missing image' }, { status: 400 });
+  const force = !!body.force;
+  // 打包下载模式(Web 勾选)：不转存 ACR，触发 workflow 拉取打包为 tar，回调下载地址
+  const downloadOnly = !!body.download_only;
+
+  const url = new URL(request.url);
+  const { rawName, reference } = parseImageRef(image);
+  const source = resolveSource(rawName);
+  const acrRepo = source.alias + '/' + source.imageName;
+  // 下载模式用 dl: 前缀键，与转存模式 <repo>:<ref> 隔离(不占槽位、互不影响)
+  const key = downloadOnly ? downloadKeyOf(acrRepo, reference) : acrRepo + ':' + reference;
+  const sitePrefix = env.SITE_PASSWORD ? '/' + env.SITE_PASSWORD : '';
+  const pullAddr = buildHubPullAddress(env, source, source.imageName, reference, url);
+  // 转存前的源地址(上游 registry 完整引用)，仅用于界面展示，与转存后的拉取地址区分
+  const srcAddr = `${source.registry}/${source.imageName}${reference.startsWith('sha256:') ? '@' : ':'}${reference}`;
+  const progress = hubBase(env, url) + sitePrefix + '/status?key=' + encodeURIComponent(key);
+
+  async function doTrigger() {
+    // 全局限流：超出每小时触发上限直接返回，不消耗 Actions 额度
+    const rl = await checkRateLimit(env);
+    if (!rl.ok) {
+      return {
+        status: 'pending',
+        key,
+        source_address: srcAddr,
+        pull_address: pullAddr,
+        pull_command: 'docker pull ' + pullAddr,
+        progress,
+        trigger_failed: true,
+        trigger_error: `触发过于频繁：已达每小时上限 ${rl.limit} 次，请稍后再试`,
+      };
+    }
+    // 触发锁去重：并发提交同一 key 时只放行一个触发，其余返回 syncing 由前端轮询
+    const locked = await env.DOCKER_KV.get(triggerLockKeyOf(key));
+    if (locked !== null) {
+      return {
+        status: 'syncing',
+        key,
+        source_address: srcAddr,
+        pull_address: pullAddr,
+        pull_command: 'docker pull ' + pullAddr,
+        progress,
+      };
+    }
+    await env.DOCKER_KV.put(triggerLockKeyOf(key), '1', { expirationTtl: TRIGGER_LOCK_TTL });
+    const slot = await allocateSlot(env, key);
+    const acrTag = slotTagName(env, slot);
+    // 覆盖已有镜像前先备份其 ready 状态：若本次覆盖转存失败需恢复，保证旧镜像仍可拉取、槽位不丢
+    // 新增转存(此前非 ready)失败则不留备份，回调时会释放槽位
+    if (st && st.status === STATUS.READY) {
+      await putStatus(env.DOCKER_KV, BACKUP_PREFIX + key, st, 3600);
+    } else {
+      await env.DOCKER_KV.delete(BACKUP_PREFIX + key);
+    }
+    await putStatus(env.DOCKER_KV, key, { status: STATUS.SYNCING, acr_repo: acrRepo, acr_tag: acrTag, updated_at: Date.now() }, 1800);
+    let triggerResult = { ok: false, status: 0, detail: '' };
+    try { triggerResult = await triggerSync(env, source, reference, acrRepo, acrTag); } catch { triggerResult = { ok: false, status: 0, detail: 'exception' }; }
+    const triggered = triggerResult.ok;
+    if (!triggered) {
+      // 触发失败：立即释放本次占用的槽位，不占用 imageXXX 序号、不留下 map/slot 映射
+      await releaseSlot(env, key);
+      await putStatus(env.DOCKER_KV, key, { status: STATUS.PENDING, acr_repo: acrRepo, acr_tag: acrTag, updated_at: Date.now() }, 600);
+    }
+    return {
+      status: triggered ? 'syncing' : 'pending',
+      key,
+      source_address: srcAddr,
+      pull_address: pullAddr,
+      pull_command: 'docker pull ' + pullAddr,
+      progress,
+      trigger_failed: !triggered,
+      trigger_error: triggered ? null : `GitHub 返回 ${triggerResult.status}: ${triggerResult.detail}`,
+    };
+  }
+
+  // 打包下载模式触发：不分配 ACR 槽位、不写备份，仅置 syncing 并触发 workflow 的 package job
+  async function doTriggerDownload() {
+    const rl = await checkRateLimit(env);
+    if (!rl.ok) {
+      return {
+        status: 'pending', mode: 'download', key, source_address: srcAddr, progress,
+        trigger_failed: true,
+        trigger_error: `触发过于频繁：已达每小时上限 ${rl.limit} 次，请稍后再试`,
+      };
+    }
+    const locked = await env.DOCKER_KV.get(triggerLockKeyOf(key));
+    if (locked !== null) {
+      return { status: 'syncing', mode: 'download', key, source_address: srcAddr, progress };
+    }
+    await env.DOCKER_KV.put(triggerLockKeyOf(key), '1', { expirationTtl: TRIGGER_LOCK_TTL });
+    await putStatus(env.DOCKER_KV, key, { status: STATUS.SYNCING, mode: 'download', acr_repo: acrRepo, updated_at: Date.now() }, 1800);
+    let triggerResult = { ok: false, status: 0, detail: '' };
+    try { triggerResult = await triggerSync(env, source, reference, acrRepo, 'download', true); } catch { triggerResult = { ok: false, status: 0, detail: 'exception' }; }
+    const triggered = triggerResult.ok;
+    if (!triggered) {
+      await putStatus(env.DOCKER_KV, key, { status: STATUS.PENDING, mode: 'download', acr_repo: acrRepo, updated_at: Date.now() }, 600);
+    }
+    return {
+      status: triggered ? 'syncing' : 'pending',
+      mode: 'download', key, source_address: srcAddr, progress,
+      trigger_failed: !triggered,
+      trigger_error: triggered ? null : `GitHub 返回 ${triggerResult.status}: ${triggerResult.detail}`,
+    };
+  }
+
+  let st = await getStatus(env.DOCKER_KV, key);
+  st = await guardStale(env.DOCKER_KV, key, st);
+  // 打包下载：ready 但已过有效期(文件已被定时任务删除) → 视为不存在，允许重新打包
+  if (downloadOnly && isDownloadExpired(st)) st = null;
+
+  // ---- 打包下载模式：已就绪则直接给下载地址；否则触发/等待 ----
+  if (downloadOnly) {
+    if (st && st.status === STATUS.READY) {
+      if (force) return Response.json(await doTriggerDownload());
+      return Response.json({
+        status: 'ready',
+        mode: 'download',
+        key,
+        source_address: srcAddr,
+        download_url: st.download_url || null,
+        file_name: st.file_name || null,
+        file_size: st.file_size || null,
+        file_sha256: st.file_sha256 || null,
+        archive_format: st.archive_format || null,
+        expires_at: st.expires_at || null,
+        progress,
+      });
+    }
+    if (st && st.status === STATUS.SYNCING) {
+      return Response.json({ status: 'syncing', mode: 'download', key, source_address: srcAddr, progress });
+    }
+    // failed / pending / 不存在：显式提交即重新打包
+    return Response.json(await doTriggerDownload());
+  }
+
+  // 已就绪
+  if (st && st.status === STATUS.READY) {
+    if (force) {
+      // 强制更新：复用原槽位覆盖式重新转存
+      return Response.json(await doTrigger());
+    }
+    return Response.json({
+      status: 'ready',
+      key,
+      source_address: srcAddr,
+      pull_address: pullAddr,
+      pull_command: 'docker pull ' + pullAddr,
+      last_error: st.last_error || null,
+      progress,
+    });
+  }
+
+  // 转存中(强制更新也无需重复触发)
+  if (st && st.status === STATUS.SYNCING) {
+    return Response.json({
+      status: 'syncing',
+      key,
+      source_address: srcAddr,
+      pull_address: pullAddr,
+      pull_command: 'docker pull ' + pullAddr,
+      progress,
+    });
+  }
+
+  // 转存失败(上游错误/回调失败)：显式提交即视为重试，直接重新触发，
+  // 避免上一次的旧错误(如已修好的 flag 问题)长期残留、必须勾「强制更新」才能重跑。
+  if (st && st.status === STATUS.FAILED) {
+    return Response.json(await doTrigger());
+  }
+
+  // 未转存(pending / 不存在)
+  return Response.json(await doTrigger());
+}
+
+// ---- 入口 ----
+
+// 进度查询(根路径 /status 与密码子路径 /<pwd>/status 共用)
+async function handleStatus(env, url) {
+  const key = decodeURIComponent(url.searchParams.get('key') || '');
+  let st = key ? await getStatus(env.DOCKER_KV, key) : null;
+  st = await guardStale(env.DOCKER_KV, key, st);
+  // 打包下载：文件已过 12 小时有效期并被自动删除，向前端明示，引导重新打包
+  const hdrs = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
+  if (isDownloadExpired(st)) {
+    return Response.json({ status: 'expired', mode: 'download', key, expires_at: st.expires_at }, {
+      headers: hdrs,
+    });
+  }
+  return Response.json(st || { status: STATUS.PENDING }, {
+    headers: hdrs,
+  });
+}
+
+async function route(request, env) {
+    const url = new URL(request.url);
+    const method = request.method;
+    let path = url.pathname;
+
+    // 1. /v2 探活：声明支持 Registry API V2(registry 始终开放，不受密码限制)
+    if (path === '/v2' || path === '/v2/') {
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'Docker-Distribution-Api-Version': 'registry/2.0',
+          'Content-Type': 'application/json',
+        },
+      });
+    }
+
+    // 2. 内部回调(GitHub Actions 调用，凭共享密钥校验，始终开放)
+    if (path === '/internal/callback' && method === 'POST') {
+      return handleCallback(request, env);
+    }
+
+    // 3. 进度查看(registry 503 中的链接会用到，始终保持根路径开放)
+    if (path === '/status' && method === 'GET') {
+      return handleStatus(env, url);
+    }
+
+    // 4. 密码保护(仅作用于 Web 界面与触发接口；子路径形式，如 /zwzw)
+    //    registry 的 /v2/... 必须放行：docker 客户端无法携带密码子路径，
+    //    一旦被拦截会 302 跳到伪装站，导致把伪装页面当镜像层下载(大小校验失败 / EOF)。
+    const sitePassword = env.SITE_PASSWORD ? String(env.SITE_PASSWORD).trim() : '';
+    const sitePrefix = sitePassword ? '/' + sitePassword : '';
+    const isRegistryPath = path.startsWith('/v2/');
+    if (sitePrefix && !isRegistryPath) {
+      const ok = path === sitePrefix || path.startsWith(sitePrefix + '/');
+      if (!ok) {
+        // 未命中密码子路径：跳转伪装链接(未配置 CAMOUFLAGE_URL 时用默认伪装站)
+        return Response.redirect(camouflageUrl(env), 302);
+      }
+      path = path.slice(sitePrefix.length) || '/';
+    }
+
+    // 5. Web 界面与接口(路径已剥离前缀)
+    if ((path === '/' || path === '/ui') && method === 'GET') {
+      // 注入密码子路径前缀：页面内的 api/status 请求必须同样带前缀，
+      // 否则会被判为未授权而 302 跳到伪装站，导致跨域(CORS)失败。
+      const html = HOME_HTML.replace(/__PREFIX__/g, sitePrefix);
+      return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+    // 带密码前缀时的进度查询(如 /zwzw/status)，剥离前缀后在此命中
+    if (path === '/status' && method === 'GET') {
+      return handleStatus(env, url);
+    }
+    if (path === '/api/mirror' && method === 'POST') {
+      return handleMirrorApi(request, env);
+    }
+
+    // 6. Registry V2 请求(/v2/... 始终开放)
+    //    tags/list：crane / containerd / ctr 等客户端会请求；本服务不维护 tag 列表，
+    //    返回空列表满足协议形状(docker pull 主流程不经过该接口)。
+    const tagsM = path.match(/^\/v2\/(.+)\/tags\/list$/);
+    if (tagsM && method === 'GET') {
+      return Response.json({ name: tagsM[1], tags: [] }, {
+        headers: { 'Docker-Distribution-Api-Version': 'registry/2.0', 'Content-Type': 'application/json' },
+      });
+    }
+    const parsed = parseRegistryPath(path);
+    if (!parsed) {
+      return new Response('Not Found', { status: 404 });
+    }
+
+    const source = resolveSource(parsed.rawName);
+    const acrRepo = `${source.alias}/${source.imageName}`;
+    const key = `${acrRepo}:${parsed.reference}`;
+
+    if (parsed.type === 'manifests') {
+      return handleManifest(env, source, parsed.reference, key, acrRepo, url, method);
+    }
+    if (parsed.type === 'blobs') {
+      return handleBlob(env, parsed.reference, acrRepo);
+    }
+
+    return new Response('Not Found', { status: 404 });
+  }
+
+export default {
+  async fetch(request, env) {
+    // 入口守卫：KV 绑定缺失时给出明确可操作的报错，而不是 cryptic 的 "reading 'get'"
+    if (!env || !env.DOCKER_KV) {
+      return Response.json(
+        {
+          error:
+            'KV 绑定 DOCKER_KV 未配置',
+        },
+        { status: 500, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    try {
+      return await route(request, env);
+    } catch (e) {
+      return Response.json(
+        { error: (e && e.message) || String(e), stack: e && e.stack },
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+  },
+};
