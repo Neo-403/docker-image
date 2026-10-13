@@ -262,6 +262,7 @@ jobs:
         id: rel
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}   # owner/repo：package job 不 checkout 代码，必须显式指定 --repo，否则 gh 因找不到 .git 而失败
           FILE: ${{ steps.ref.outputs.file }}
           DISPLAY: ${{ github.event.inputs.display_name }}
           FORMAT: ${{ steps.pkg.outputs.format }}
@@ -270,13 +271,14 @@ jobs:
           TAG="dl-$(date -u +%Y%m%d-%H%M%S)-${{ github.run_id }}"
           NOTES=$(printf '源镜像: %s\n打包时间(UTC): %s\n打包格式: %s\n有效期: 12 小时，到期自动删除\n本地加载: docker load -i %s\n' \
             "$DISPLAY" "$(date -u '+%F %T')" "$FORMAT" "$FILE")
-          if ! gh release create "$TAG" "$FILE" --title "$DISPLAY 打包下载" --notes "$NOTES" 2> gh_err.log; then
+          # --repo 显式指定目标仓库(不依赖本地 .git)，gh 才能创建 Release/读取资产下载地址
+          if ! gh release create --repo "$REPO" "$TAG" "$FILE" --title "$DISPLAY 打包下载" --notes "$NOTES" 2> gh_err.log; then
             cat gh_err.log >&2 || true
             ERR_LINE=$(tail -n 5 gh_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
             echo "PKG_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          URL=$(gh release view "$TAG" --json assets --jq '.assets[0].browserDownloadUrl')
+          URL=$(gh release view --repo "$REPO" "$TAG" --json assets --jq '.assets[0].browserDownloadUrl')
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: 回调 Workers(成功 -> ready，带回下载地址)
