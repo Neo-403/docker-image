@@ -1,0 +1,39 @@
+name: 清理过期下载包
+
+# 打包下载模式的 tar 通过 Release 资产分发。GitHub 没有 12 小时级别的原生过期机制
+# (artifact retention-days 最短为 1 天)，因此用本定时任务每小时巡检一次：
+# 删除 12 小时前创建的 dl-* Release(删除 Release 即删除其资产、释放存储)，git tag 一并清理。
+# Worker 侧的 dl: KV 记录由 TTL 自动过期，无需人工干预。
+on:
+  schedule:
+    - cron: '37 * * * *'   # UTC 每小时第 37 分执行(错开整点高峰)
+  workflow_dispatch:        # 也可在 Actions 页手动立即执行
+
+permissions:
+  contents: write           # 删除 Release 与 tag 需要写权限(内置 GITHUB_TOKEN 即可)
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 删除超过 12 小时的 dl-* Release(含资产，释放存储)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE_HOURS: '12'
+        run: |
+          cutoff=$(date -u -d "-${MAX_AGE_HOURS} hours" +%s)
+          gh api --paginate "repos/${{ github.repository }}/releases?per_page=100" > releases.json
+          count=$(jq -s 'add // [] | length' releases.json)
+          echo "Release 总数: $count，清理阈值(UTC): $(date -u -d "@$cutoff" '+%F %T')"
+          jq -s 'add // [] | .[] | select(.tag_name | startswith("dl-")) | [.tag_name, .published_at] | @tsv' releases.json | \
+          while IFS=$'\t' read -r tag published; do
+            ts=$(date -u -d "$published" +%s 2>/dev/null || echo 0)
+            if [[ "$ts" -gt 0 && "$ts" -lt "$cutoff" ]]; then
+              echo "删除过期下载包: $tag (发布于 $published)"
+              # --cleanup 连 git tag 一起删除；已删除过的会报错，忽略即可
+              gh release delete "$tag" --cleanup --yes || echo "删除失败(可能已不存在): $tag"
+            else
+              echo "保留(未到期): $tag ($published)"
+            fi
+          done
