@@ -4,12 +4,12 @@ run-name: "${{ github.event.inputs.display_name }} -> ${{ github.event.inputs.ac
 
 # 由 Cloudflare Workers 通过 workflow_dispatch 触发
 #  inputs:
-#   source_alias    : 源缩写（dockerhub / ghcr / quay ...），用于 ACR tag 前缀
-#   source_registry : 上游 registry（如 docker.io / ghcr.io / quay.io）
-#   image_name      : 上游镜像名（如 library/nginx / bitnami/nginx / nginx）
-#   image_ref       : Tag（如 latest）或 digest（sha256:...）
-#   acr_repo        : 逻辑仓库标识（含源别名前缀，仅用于回调 KV key，如 dockerhub/library/nginx）
-#   acr_repo_name   : 单一物理 ACR 仓库名（所有镜像统一推送到此，由 Worker 的 ACR_REPO 注入）
+#   source_alias    : 源缩写(dockerhub / ghcr / quay ...)，用于 ACR tag 前缀
+#   source_registry : 上游 registry(如 docker.io / ghcr.io / quay.io)
+#   image_name      : 上游镜像名(如 library/nginx / bitnami/nginx / nginx)
+#   image_ref       : Tag(如 latest)或 digest(sha256:...)
+#   acr_repo        : 逻辑仓库标识(含源别名前缀，仅用于回调 KV key，如 dockerhub/library/nginx)
+#   acr_repo_name   : 单一物理 ACR 仓库名(所有镜像统一推送到此，由 Worker 的 ACR_REPO 注入)
 on:
   workflow_dispatch:
     inputs:
@@ -20,19 +20,19 @@ on:
         description: '上游镜像名，如 library/nginx 或 bitnami/nginx 或 nginx'
         required: true
       image_ref:
-        description: 'Tag（如 latest）或 digest（sha256:...）'
+        description: 'Tag(如 latest)或 digest(sha256:...)'
         required: true
       acr_repo:
-        description: '逻辑仓库标识（含源别名前缀，用于回调 KV key）'
+        description: '逻辑仓库标识(含源别名前缀，用于回调 KV key)'
         required: true
       acr_repo_name:
-        description: '单一物理 ACR 仓库名（所有镜像统一推送目标）'
+        description: '单一物理 ACR 仓库名(所有镜像统一推送目标)'
         required: true
       acr_tag:
-        description: '目标槽位 tag（如 image037），由 Worker 分配'
+        description: '目标槽位 tag(如 image037)，由 Worker 分配'
         required: true
       display_name:
-        description: '运行列表展示名（含 tag；Docker Hub 不带 dockerhub/、library/ 前缀）'
+        description: '运行列表展示名(含 tag；Docker Hub 不带 dockerhub/、library/ 前缀)'
         required: false
         default: ''
 
@@ -42,8 +42,9 @@ jobs:
     timeout-minutes: 30
     steps:
       # 用缓存安装 skopeo / jq：命中缓存时直接复用，跳过 apt-get update + 下载，显著缩短启动耗时
+      # 第三方 action 固定到 commit SHA(而非 tag)：防止 tag 被移改后供应链投毒/行为漂移
       - name: 安装依赖 (skopeo / jq，带缓存)
-        uses: awalsh128/cache-apt-pkgs-action@v1.5.1
+        uses: awalsh128/cache-apt-pkgs-action@4c82c3ccdc1344ee11e9775dbdbdf43aa8a5614e # v1.5.1
         with:
           packages: skopeo jq
           version: 1.0
@@ -60,7 +61,7 @@ jobs:
           NS: ${{ secrets.ACR_NAMESPACE }}
         run: |
           if [[ "$REF" == sha256:* ]]; then SEP="@"; else SEP=":"; fi
-          # 目标 tag 由 Worker 分配的固定槽位（image001..imageN），直接复用
+          # 目标 tag 由 Worker 分配的固定槽位(image001..imageN)，直接复用
           echo "src=${SRC_REG}/${NAME}${SEP}${REF}"            >> "$GITHUB_OUTPUT"
           echo "dest=${REG}/${NS}/${ACR_REPO_NAME}:${ACR_TAG}" >> "$GITHUB_OUTPUT"
           echo "tag=${ACR_TAG}"                                >> "$GITHUB_OUTPUT"
@@ -71,6 +72,20 @@ jobs:
             --username "${{ secrets.ACR_USERNAME }}" \
             --password "${{ secrets.ACR_PASSWORD }}"
 
+      # Docker Hub 登录为可选项：配置了 DOCKERHUB_USERNAME/PASSWORD 则登录(拉取限额从匿名提升到认证用户)；
+      # 未配置则走匿名拉取。两个 secret 需同时配置才生效，只配一个也按匿名处理。
+      - name: 登录 Docker Hub (可选，未配置则匿名)
+        env:
+          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+        run: |
+          if [[ -n "$DH_USERNAME" && -n "$DH_PASSWORD" ]]; then
+            echo "已配置 Docker Hub 凭据，执行登录(认证用户拉取限额)"
+            skopeo login docker.io --username "$DH_USERNAME" --password "$DH_PASSWORD"
+          else
+            echo "未配置 Docker Hub 凭据，走匿名拉取"
+          fi
+
       - name: 转存镜像 (skopeo copy)
         id: copy
         env:
@@ -78,14 +93,14 @@ jobs:
           DEST: docker://${{ steps.ref.outputs.dest }}
         run: |
           echo "Copy: $SRC -> $DEST"
-          # 捕获 skopeo 错误日志，失败时随回调带回，便于前端展示真实原因；--retry-times 应对上游瞬时抖动（旧版 skopeo 不支持 --retry-delay，故省略）
+          # 捕获 skopeo 错误日志，失败时随回调带回，便于前端展示真实原因；--retry-times 应对上游瞬时抖动(旧版 skopeo 不支持 --retry-delay，故省略)
           if ! skopeo copy --retry-times 3 "$SRC" "$DEST" 2> skopeo_err.log; then
             ERR_LINE=$(tail -n 5 skopeo_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
             echo "SKOPEO_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-      - name: 收集完整 digest 列表（index -> 平台 manifest -> layer/config）
+      - name: 收集完整 digest 列表(index -> 平台 manifest -> layer/config)
         if: steps.copy.outcome == 'success'
         id: blobs
         env:
@@ -117,7 +132,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: 回调 Workers（成功 -> ready）
+      - name: 回调 Workers(成功 -> ready)
         if: success()
         env:
           URL: ${{ secrets.CALLBACK_URL }}
@@ -136,7 +151,7 @@ jobs:
                   --argjson blobs "$BLOBS_JSON" \
                   '{acr_repo:$repo, image_ref:$ref, status:"ready", blobs:$blobs}')"
 
-      - name: 回调 Workers（失败 -> failed，携带原因）
+      - name: 回调 Workers(失败 -> failed，携带原因)
         if: failure()
         env:
           URL: ${{ secrets.CALLBACK_URL }}
@@ -151,5 +166,5 @@ jobs:
             -d "$(jq -n \
                   --arg repo "$ACR_REPO" \
                   --arg ref "$REF" \
-                  --arg err "${ERR:-skopeo 转存失败（无详细日志）}" \
+                  --arg err "${ERR:-skopeo 转存失败(无详细日志)}" \
                   '{acr_repo:$repo, image_ref:$ref, status:"failed", error:$err}')"
