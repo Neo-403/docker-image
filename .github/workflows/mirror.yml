@@ -1,15 +1,20 @@
 name: Mirror Docker Image
-# 运行列表直接显示正在转存的镜像与槽位，便于排查问题
-run-name: "${{ github.event.inputs.display_name }} -> ${{ github.event.inputs.acr_tag }}"
+# 运行列表直接显示正在处理的镜像与去向：转存模式显示槽位 tag，打包下载模式显示「打包下载」
+# (download_only 可能是布尔或字符串，两种形态都兼容，避免外部触发方式不同导致判断失误)
+run-name: "${{ github.event.inputs.display_name }} -> ${{ (github.event.inputs.download_only == true || github.event.inputs.download_only == 'true') && '打包下载' || github.event.inputs.acr_tag }}"
 
 # 由 Cloudflare Workers 通过 workflow_dispatch 触发
-#  inputs:
-#   source_alias    : 源缩写(dockerhub / ghcr / quay ...)，用于 ACR tag 前缀
+#   inputs:
+#   source_alias    : 源缩写(dockerhub / ghcr / quay ...)，用于 ACR 仓库命名
 #   source_registry : 上游 registry(如 docker.io / ghcr.io / quay.io)
 #   image_name      : 上游镜像名(如 library/nginx / bitnami/nginx / nginx)
 #   image_ref       : Tag(如 latest)或 digest(sha256:...)
 #   acr_repo        : 逻辑仓库标识(含源别名前缀，仅用于回调 KV key，如 dockerhub/library/nginx)
-#   acr_repo_name   : 单一物理 ACR 仓库名(所有镜像统一推送到此，由 Worker 的 ACR_REPO 注入)
+#   acr_repo_name   : 单一物理 ACR 仓库名(所有镜像统一推送目标，由 Worker 的 ACR_REPO 注入)
+#   acr_tag         : 目标槽位 tag(如 image037)，由 Worker 分配；打包下载模式下传 'download'(不使用)
+#   display_name    : 运行列表展示名(含 tag；Docker Hub 不带 dockerhub/、library/ 前缀)
+#   download_only   : true = 打包下载模式(不转存 ACR)：GitHub 拉取镜像打成 tar 上传 Release 供下载，12 小时后自动删除；
+#                     false/省略 = 转存模式(skopeo copy 到 ACR，原有行为)
 on:
   workflow_dispatch:
     inputs:
@@ -23,7 +28,7 @@ on:
         description: 'Tag(如 latest)或 digest(sha256:...)'
         required: true
       acr_repo:
-        description: '逻辑仓库标识(含源别名前缀，用于回调 KV key)'
+        description: '逻辑仓库标识(含源别名前缀，仅用于回调 KV key)'
         required: true
       acr_repo_name:
         description: '单一物理 ACR 仓库名(所有镜像统一推送目标)'
@@ -35,9 +40,16 @@ on:
         description: '运行列表展示名(含 tag；Docker Hub 不带 dockerhub/、library/ 前缀)'
         required: false
         default: ''
+      download_only:
+        description: '勾选后为「打包下载」模式：不转存 ACR，改为拉取镜像打成 tar 上传 Release 供下载(12 小时自动删除)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
+  # ---- 转存模式(默认)：skopeo copy DockerHub -> ACR ----
   mirror:
+    if: github.event.inputs.download_only != true && github.event.inputs.download_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -95,6 +107,8 @@ jobs:
           echo "Copy: $SRC -> $DEST"
           # 捕获 skopeo 错误日志，失败时随回调带回，便于前端展示真实原因；--retry-times 应对上游瞬时抖动(旧版 skopeo 不支持 --retry-delay，故省略)
           if ! skopeo copy --retry-times 3 "$SRC" "$DEST" 2> skopeo_err.log; then
+            # 报错同时打到步骤日志(否则只进 skopeo_err.log，Actions 日志里看不到真实原因)
+            cat skopeo_err.log >&2 || true
             ERR_LINE=$(tail -n 5 skopeo_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
             echo "SKOPEO_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
             exit 1
@@ -168,3 +182,148 @@ jobs:
                   --arg ref "$REF" \
                   --arg err "${ERR:-skopeo 转存失败(无详细日志)}" \
                   '{acr_repo:$repo, image_ref:$ref, status:"failed", error:$err}')"
+
+  # ---- 打包下载模式：不转存 ACR，拉取 -> tar -> Release 资产 -> 回调下载地址 ----
+  # 产物以 Release 资产形式分发(URL 稳定、可直接拼 ghproxy 等加速源)；
+  # 12 小时过期由同仓库 cleanup-downloads.yml 定时删除 dl-* Release 实现(删 Release 即删资产、释放存储)。
+  package:
+    if: github.event.inputs.download_only == true || github.event.inputs.download_only == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write   # 用内置 GITHUB_TOKEN 创建 Release 并上传打包文件
+    steps:
+      - name: 安装依赖 (skopeo / jq，带缓存)
+        uses: awalsh128/cache-apt-pkgs-action@4c82c3ccdc1344ee11e9775dbdbdf43aa8a5614e # v1.5.1
+        with:
+          packages: skopeo jq
+          version: 1.0
+
+      # Docker Hub 登录为可选项：配置了凭据则登录，未配置走匿名拉取(与转存模式一致)
+      - name: 登录 Docker Hub (可选，未配置则匿名)
+        env:
+          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+        run: |
+          if [[ -n "$DH_USERNAME" && -n "$DH_PASSWORD" ]]; then
+            echo "已配置 Docker Hub 凭据，执行登录(认证用户拉取限额)"
+            skopeo login docker.io --username "$DH_USERNAME" --password "$DH_PASSWORD"
+          else
+            echo "未配置 Docker Hub 凭据，走匿名拉取"
+          fi
+
+      - name: 构造源引用与文件名
+        id: ref
+        env:
+          REF: ${{ github.event.inputs.image_ref }}
+          SRC_REG: ${{ github.event.inputs.source_registry }}
+          NAME: ${{ github.event.inputs.image_name }}
+          DISPLAY: ${{ github.event.inputs.display_name }}
+        run: |
+          if [[ "$REF" == sha256:* ]]; then SEP="@"; else SEP=":"; fi
+          echo "src=${SRC_REG}/${NAME}${SEP}${REF}" >> "$GITHUB_OUTPUT"
+          # 展示名(Docker Hub 已去 library/ 前缀)，Worker 总会下发；缺失时用 名称+ref 兜底
+          if [[ -z "$DISPLAY" ]]; then DISPLAY="${NAME}${SEP}${REF}"; fi
+          # docker-archive 引用：digest 引用去掉 @sha256:...，避免路径/引用解析歧义
+          if [[ "$REF" == sha256:* ]]; then AREF="${DISPLAY%%@*}"; else AREF="$DISPLAY"; fi
+          # 文件名只保留安全字符(/ : @ 等替换为 -)
+          SAFE=$(printf '%s' "$DISPLAY" | tr '/:@' '---' | tr -cd '[:alnum:]._-')
+          echo "aref=${AREF}" >> "$GITHUB_OUTPUT"
+          echo "safe=${SAFE}" >> "$GITHUB_OUTPUT"
+          echo "file=${SAFE}.tar" >> "$GITHUB_OUTPUT"
+
+      - name: 拉取镜像并打包为 tar (docker load 兼容)
+        id: pkg
+        env:
+          SRC: docker://${{ steps.ref.outputs.src }}
+          FILE: ${{ steps.ref.outputs.file }}
+          AREF: ${{ steps.ref.outputs.aref }}
+        run: |
+          echo "Package: $SRC -> $FILE (load tag: $AREF)"
+          df -h . || true
+          # 优先 docker-archive：直接产出 docker load 兼容的单文件 tar
+          if skopeo copy --retry-times 3 "$SRC" "docker-archive:$PWD/$FILE:$AREF" 2> skopeo_err.log; then
+            echo "format=docker-archive" >> "$GITHUB_OUTPUT"
+          elif skopeo copy --retry-times 3 "$SRC" "dir:$PWD/img" 2> skopeo_err.log; then
+            # 兜底(个别多架构镜像 docker-archive 不支持)：打成 OCI 目录 tar，需用 skopeo/ctr 加载
+            tar -cf "$FILE" -C "$PWD/img" .
+            echo "format=oci-dir" >> "$GITHUB_OUTPUT"
+          else
+            # 报错同时打到步骤日志(否则只进 skopeo_err.log，Actions 日志里看不到真实原因)
+            cat skopeo_err.log >&2 || true
+            ERR_LINE=$(tail -n 5 skopeo_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
+            echo "PKG_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "size=$(stat -c%s "$FILE")" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$FILE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: 上传为 Release 资产并生成下载地址
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILE: ${{ steps.ref.outputs.file }}
+          DISPLAY: ${{ github.event.inputs.display_name }}
+          FORMAT: ${{ steps.pkg.outputs.format }}
+        run: |
+          # tag 统一 dl- 前缀：由 cleanup-downloads.yml 识别，12 小时后自动删除(释放资产存储)
+          TAG="dl-$(date -u +%Y%m%d-%H%M%S)-${{ github.run_id }}"
+          NOTES=$(printf '源镜像: %s\n打包时间(UTC): %s\n打包格式: %s\n有效期: 12 小时，到期自动删除\n本地加载: docker load -i %s\n' \
+            "$DISPLAY" "$(date -u '+%F %T')" "$FORMAT" "$FILE")
+          if ! gh release create "$TAG" "$FILE" --title "$DISPLAY 打包下载" --notes "$NOTES" 2> gh_err.log; then
+            cat gh_err.log >&2 || true
+            ERR_LINE=$(tail -n 5 gh_err.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
+            echo "PKG_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          URL=$(gh release view "$TAG" --json assets --jq '.assets[0].browserDownloadUrl')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: 回调 Workers(成功 -> ready，带回下载地址)
+        if: success()
+        env:
+          URL: ${{ secrets.CALLBACK_URL }}
+          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+          ACR_REPO: ${{ github.event.inputs.acr_repo }}
+          REF: ${{ github.event.inputs.image_ref }}
+          DL_URL: ${{ steps.rel.outputs.url }}
+          FILE: ${{ steps.ref.outputs.file }}
+          SIZE: ${{ steps.pkg.outputs.size }}
+          SHA: ${{ steps.pkg.outputs.sha256 }}
+          FORMAT: ${{ steps.pkg.outputs.format }}
+        run: |
+          # 有效期 12 小时(与 cleanup-downloads.yml 的清理阈值一致)
+          EXPIRES_MS=$(( ($(date -u +%s) + 43200) * 1000 ))
+          curl -s -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Token: $TOKEN" \
+            -d "$(jq -n \
+                  --arg repo "$ACR_REPO" \
+                  --arg ref "$REF" \
+                  --arg url "$DL_URL" \
+                  --arg fn "$FILE" \
+                  --arg sz "$SIZE" \
+                  --arg sha "$SHA" \
+                  --arg fmt "$FORMAT" \
+                  --argjson exp "$EXPIRES_MS" \
+                  '{acr_repo:$repo, image_ref:$ref, status:"ready", mode:"download",
+                    download_url:$url, file_name:$fn, file_size:($sz|tonumber),
+                    file_sha256:$sha, archive_format:$fmt, expires_at:$exp}')"
+
+      - name: 回调 Workers(失败 -> failed，携带原因)
+        if: failure()
+        env:
+          URL: ${{ secrets.CALLBACK_URL }}
+          TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+          ACR_REPO: ${{ github.event.inputs.acr_repo }}
+          REF: ${{ github.event.inputs.image_ref }}
+          ERR: ${{ steps.pkg.outputs.PKG_ERR }}${{ steps.rel.outputs.PKG_ERR }}
+        run: |
+          curl -s -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Token: $TOKEN" \
+            -d "$(jq -n \
+                  --arg repo "$ACR_REPO" \
+                  --arg ref "$REF" \
+                  --arg err "${ERR:-镜像打包失败(无详细日志)}" \
+                  '{acr_repo:$repo, image_ref:$ref, status:"failed", mode:"download", error:$err}')"
