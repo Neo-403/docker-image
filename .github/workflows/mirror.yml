@@ -278,7 +278,10 @@ jobs:
             echo "PKG_ERR=$ERR_LINE" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          URL=$(gh release view --repo "$REPO" "$TAG" --json assets --jq '.assets[0].browserDownloadUrl')
+          # 下载地址确定性构造，无需再调用 gh release view 轮询资产(GitHub API 字段为
+          # browser_download_url，易踩坑；且上传完成到资产索引就绪存在极短延迟)。
+          # 格式固定：https://github.com/<owner>/<repo>/releases/download/<tag>/<filename>
+          URL="https://github.com/${REPO}/releases/download/${TAG}/${FILE}"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: 回调 Workers(成功 -> ready，带回下载地址)
