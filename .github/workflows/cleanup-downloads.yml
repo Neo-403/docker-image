@@ -20,6 +20,7 @@ jobs:
       - name: 删除超过 12 小时的 dl-* Release(含资产，释放存储)
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}   # 本 job 不 checkout 代码，gh 命令需显式 --repo 才能定位仓库(否则报 not a git repository)
           MAX_AGE_HOURS: '12'
         run: |
           cutoff=$(date -u -d "-${MAX_AGE_HOURS} hours" +%s)
@@ -32,7 +33,7 @@ jobs:
             if [[ "$ts" -gt 0 && "$ts" -lt "$cutoff" ]]; then
               echo "删除过期下载包: $tag (发布于 $published)"
               # --cleanup 连 git tag 一起删除；已删除过的会报错，忽略即可
-              gh release delete "$tag" --cleanup --yes || echo "删除失败(可能已不存在): $tag"
+              gh release delete --repo "$REPO" "$tag" --cleanup --yes || echo "删除失败(可能已不存在): $tag"
             else
               echo "保留(未到期): $tag ($published)"
             fi
